@@ -3,7 +3,8 @@
 The stage-by-stage evidence behind [REPORT.md](../REPORT.md): what was built at each stage, and the exact command and real output that proved it worked. The report summarises these results; this file keeps the raw evidence.
 
 - [Part A: the app](#part-a-the-app) (stages 0–9)
-- [Part B: metrics](#part-b-metrics) (stages B0–B8)
+- [Part B: metrics](#part-b-metrics) (stages B0–B9)
+- [Part C: logs](#part-c-logs) (stages C0–C7)
 
 ---
 
@@ -649,3 +650,191 @@ $ ... select(.event=="anomaly_detected" and (.request_id|startswith("ui-"))) ...
 2026-09-26T11:35:23.804Z dev-100 temperature_high
 ...
 ```
+
+---
+
+## Part C: logs
+
+#### Stage C0 — Prerequisites and Docker log rotation
+
+**Checked:**
+- 2.5 GiB of RAM was available.
+- `vm.max_map_count=1048576`, which is at least the 262,144 Elasticsearch needs, so no `sudo` was required.
+- Latest Elastic 9.x images: `elasticsearch:9.5.3`, `kibana:9.5.3` and `elastic/filebeat:9.5.3`. All three are pinned to the same version.
+
+**Built:** an `x-app-logging` anchor in `docker-compose.yml` (`json-file`, `max-size: 10m`, `max-file: 3`), applied to `api` and `simulator`. Before this, Docker's log files had no size limit.
+```
+$ docker inspect <api> --format '{{.HostConfig.LogConfig.Type}} {{json .HostConfig.LogConfig.Config}}'
+json-file {"max-file":"3","max-size":"10m"}   path=/var/lib/docker/containers/aff99987…/aff99987…-json.log
+```
+
+#### Stage C1 — Elasticsearch
+
+**Built:** service `elasticsearch`:
+- single node, security off, heap fixed at 512 MB,
+- volume `es-data`,
+- port **127.0.0.1**:9200 only,
+- a healthcheck waiting for `yellow`.
+```
+$ curl -s localhost:9200 | jq -c '{cluster_name, version: .version.number}'
+{"cluster_name":"sensor-logs","version":"9.5.3"}
+$ curl -s localhost:9200/_cluster/health | jq -c '{status, number_of_nodes}'
+{"status":"green","number_of_nodes":1}
+heap_max_mb=512 · container memory 844 MiB · docker port → 127.0.0.1:9200
+```
+
+#### Stage C2 — Retention policy and index template
+
+**Built:**
+- `monitoring/elasticsearch/ilm-policy.json`: hot phase rolls over at `max_age: 10m` or 1 GB; delete phase deletes 1 h after rollover.
+- `monitoring/elasticsearch/index-template.json`: pattern `sensor-logs*`, a data stream, 1 shard / 0 replicas, and `dynamic: false` with 29 explicitly typed fields.
+- The ILM poll interval is set to 1 m.
+
+**Verified** on a throwaway data stream, `sensor-logs-test`:
+```
+policy: {"hot":{"max_age":"10m","max_primary_shard_size":"1gb"},"delete_after":"1h"}
+template: {"patterns":["sensor-logs*"],"lifecycle":"sensor-logs-policy","dynamic":false,"fields":29}
+POST sensor-logs-test/_doc {…,"errors":[{"field":"humidity_pct",…}],"password":"hunter2"}
+  → created in .ds-sensor-logs-test-2026.09.26-000001, policy sensor-logs-policy attached
+mapping has "password"?                     false
+term errors.field:humidity_pct              1 hit
+match password:hunter2                      0 hits   (not indexed)
+_source.password                            "hunter2" (but still STORED)
+```
+**Lesson:** `dynamic: false` limits what is *searchable*, not what is *stored*. Keeping secrets out is the app's job: its field whitelist means they're never written.
+
+#### Stage C3 — Filebeat
+
+**Built:** `monitoring/filebeat/filebeat.yml`:
+- Docker autodiscover plus a `filestream` input per matching container, using the `container` parser.
+- Four processors: `copy_fields` (message → `log.original`), `decode_json_fields` (to the root, `overwrite_keys`, `add_error_key: false`), `timestamp` (from our `timestamp`), and `drop_fields`.
+- Output to the `sensor-logs` data stream; Filebeat's own template and ILM are switched off.
+- The service runs as root with read-only mounts of `/var/lib/docker/containers` and `docker.sock`, plus volume `filebeat-data` for the registry.
+
+**Problems found and fixed:**
+1. **No inputs started.** A condition on `docker.container.labels.com_docker_compose_service` never matched. A debug run (`-d autodiscover`) showed that Filebeat nests the dotted label keys (`container.labels.com.docker.compose.project.value`), and `labels.dedot: true` didn't change that. The fix was to match on the name Compose gives each container: `regexp: container.name: "^esd_hw1-(api|simulator)-[0-9]+$"`. Then: `Input 'filestream' starting` ×2, and `Connection to backoff(elasticsearch(http://elasticsearch:9200)) established`.
+2. **Personal data in every document.** Autodiscover attached `docker.container.labels`, including `com_docker_compose_project_working_dir: /home/muhammad-affan/…`, which is the user's name. I added `docker` to `drop_fields`, then deleted the data stream and the Filebeat registry so everything was re-ingested from Docker's log files.
+
+   I also found that a check using `exists`/`query_string` returned 0 even while the field was present, because those queries only see *indexed* fields. The reliable check is to scan `_source`:
+```
+docs: 9248 · sources with a docker key: 0 · sources mentioning /home/: 0
+distinct top-level keys: @timestamp anomaly_reasons battery_pct config container device_id duration_ms errors event fault
+                         host humidity_pct is_anomaly level log logger message method path reading_id request_id service
+                         stats status_code stream temperature_c
+docs by container: esd_hw1-api-1 8865 · esd_hw1-simulator-1 99      (only our two services)
+docs by event: http_request 4528, reading_stored 3991, anomaly_detected 277, reading_rejected 64, sim_send_failed 64, sim_summary 34, …
+```
+
+#### Stage C4 — Kibana, provisioned
+
+**Built:**
+- Service `kibana` (127.0.0.1:5601, with a healthcheck on `/api/status`).
+- One-shot service `logs-setup` (`curlimages/curl:8.16.0`) running `monitoring/logs-setup.sh`: poll interval, policy, template, then an import of `monitoring/kibana/saved-objects.ndjson` (the data view `sensor-logs` plus 7 saved searches) and setting the default data view.
+- `filebeat` has `depends_on: logs-setup: service_completed_successfully`.
+```
+[logs-setup] importing Kibana saved objects (data view + saved searches)
+{"successCount":8,"success":true,"warnings":[],…}
+[logs-setup] done                     exit code: 0
+data views: {"id":"sensor-logs","name":"Sensor logs","title":"sensor-logs"} · default: sensor-logs · 37 fields
+saved searches (query → hits at the time):
+  Errors and warnings        level : ("ERROR" or "WARNING")                          460
+  Server errors (5xx)        event : "http_request" and status_code >= 500          0
+  Slow requests (> 100 ms)   event : "http_request" and duration_ms > 100           21
+  Rejected readings (422)    event : "reading_rejected"                              73
+  Anomalies                  event : "anomaly_detected"                              314
+  Fault injection            event : ("fault_injected" or "fault_config_changed")    0
+  Simulator send failures    service : "simulator" and event : "sim_send_failed"     73
+```
+Kibana 9 migrated the imported searches to its new `tabs` format; the queries were kept intact.
+
+**A real incident found through the logs:** the "Slow requests" search found 20 `POST /readings` requests of up to 424 ms, all between 17:15 and 17:17 UTC, just after Elasticsearch started and while the Kibana and Filebeat images were being unpacked. Part B's host metrics explain them:
+```
+UTC       disk write   p95 POST /readings
+17:05      1.2 MB/s     19.9 ms
+17:15:30  29.5 MB/s     36.1 ms
+17:16:30  10.0 MB/s     54.6 ms
+17:20      0.7 MB/s     23.7 ms
+```
+The logs found *which* requests were slow; the metrics showed *why* (disk contention slowing SQLite's flushes to disk).
+
+**Housekeeping:** the "Help us improve the Elastic Stack" banner was hidden in the screenshots. `TELEMETRY_BANNER` isn't among the settings Kibana's Docker image accepts from the environment; `TELEMETRY_ALLOWCHANGINGOPTINSTATUS=false` (with `TELEMETRY_OPTIN=false`) is.
+
+#### Stage C5 — Worked example: raw line → stored document → Kibana search
+
+I sent `POST /readings` with `X-Request-ID: c5-demo-1` and 41.5 °C, which returned `201` with `["temperature_high"]`.
+```
+1. app stdout (docker compose logs api):
+{"timestamp": "2026-09-26T17:28:33.009Z", "level": "WARNING", "service": "sensor-api", "logger": "app", "event": "anomaly_detected", "message": "anomaly detected: temperature_high", "request_id": "c5-demo-1", "device_id": "dev-100", "reading_id": 116760, "anomaly_reasons": ["temperature_high"], "temperature_c": 41.5, "humidity_pct": 45.0, "battery_pct": 88.0}
+
+2. Docker's file /var/lib/docker/containers/aff99987…/aff99987…-json.log (read through filebeat's read-only mount):
+{"log":"{\"timestamp\": \"2026-09-26T17:28:33.009Z\", … \"battery_pct\": 88.0}\n","stream":"stdout","time":"2026-09-26T17:28:33.01002747Z"}
+
+3. stored document (.ds-sensor-logs-2026.09.26-000001), _source abridged:
+{"@timestamp":"2026-09-26T17:28:33.009Z","level":"WARNING","service":"sensor-api","event":"anomaly_detected",
+ "message":"anomaly detected: temperature_high","request_id":"c5-demo-1","device_id":"dev-100","reading_id":116760,
+ "anomaly_reasons":["temperature_high"],"temperature_c":41.5,"humidity_pct":45,"battery_pct":88,"stream":"stdout",
+ "container":{"name":"esd_hw1-api-1","image":{"name":"sensor-api:dev"},"id":"aff99987…"},"host":{"name":"911f183df3ff"},
+ "log":{"original":"{\"timestamp\": \"2026-09-26T17:28:33.009Z\", … }\n"}}
+field types: request_id keyword · level keyword · event keyword · temperature_c float · anomaly_reasons keyword · log.original keyword (not indexed)
+
+4. all documents for the request (request_id : "c5-demo-1"): reading_stored (INFO) · anomaly_detected (WARNING) · http_request (INFO, duration_ms 6.53)
+```
+`@timestamp` is the app's time (…33.009Z), not Docker's (…33.010Z). The screenshots are `docs/screenshots/c_kibana_request_id.png`, `c_kibana_document.png`, `c_kibana_warnings.png` and `c_kibana_rejected_saved_search.png`.
+
+#### Stage C6 — No secrets or personal data in the pipeline
+
+I planted fake values in every place a client can put them:
+- an `Authorization: Bearer SECRETTOKEN-c6` header,
+- a `Cookie: session=SECRETCOOKIE-c6` header,
+- extra body fields `"password":"SECRETPASSWORD-c6"` and `"owner_email":"jane.doe@example.com"` (returned 201),
+- a password inside a body rejected with 422,
+- `GET /devices?token=SECRETQUERY-c6`.
+```
+stored for these requests: reading_stored · http_request path=/readings 201 · reading_rejected errors=[{humidity_pct, less_than_equal}] ·
+                           http_request 422 · http_request path=/devices 200   (route template only: no query string)
+scanned 11343 documents' _source incl. log.original:
+{'SECRETTOKEN': 0, 'SECRETCOOKIE': 0, 'SECRETPASSWORD': 0, 'SECRETQUERY': 0, 'jane.doe': 0, 'example.com': 0,
+ 'Bearer': 0, 'password': 0, 'owner_email': 0, '/home/': 0}
+raw Docker logs of api: 0 for each value
+```
+None of the Filebeat processors adds data: `copy_fields` copies our own line, `decode_json_fields` parses it, `timestamp` re-uses a field, and `drop_fields` only removes. Autodiscover's Docker labels, which did contain a home path (C3), are dropped.
+
+#### Stage C7 — What survives what, and retention
+
+| Action | Docker log (`docker compose logs api`) | Elasticsearch | Notes |
+|---|---|---|---|
+| `docker compose restart api` | c5-demo-1: 3 → 3 | 3 → 3 | same container, same log file |
+| `docker compose up -d --force-recreate api` | 3 → **0** | 3 → **3** | the new container starts a new, empty log file. Autodiscover started an input for it within about 6 s (165 documents) |
+| `docker compose restart filebeat` | — | c5-demo-1 3 → 3 | **no duplicates**: the registry (`filebeat-data`) remembers the read position |
+| Filebeat stopped for 20 s while the app logged `c7-while-down` | 2 lines | 0 while stopped → **2** after start | nothing lost; Filebeat resumed from its saved position. (The total rose 12038 → 12083 at first: documents already in flight became searchable after the 1 s refresh.) |
+| `docker compose restart elasticsearch` | — | 12350 → 12350 | `es-data` volume |
+| `docker compose down` then `up -d --build` | recreated (empty) | 18851 → 18908 and growing; c5-demo-1 still 3 | about 2 min to be fully up. Order: elasticsearch healthy → logs-setup (exit 0) → filebeat |
+
+**Retention (ILM):**
+```
+.ds-sensor-logs-2026.09.26-000001  created 17:25:43Z · rolled over 17:36:20Z (10.6 min: 10m + ≤1m poll) · 14652 docs
+.ds-sensor-logs-2026.09.26-000002  created 17:36:20Z · rolled over 17:46:23Z
+.ds-sensor-logs-2026.09.26-000003  created 17:46:23Z (current write index)
+explain -000001: {"phase":"hot","action":"complete","age":"10.93m", since rollover: 10 min} → delete due ≈ 18:36–18:37Z
+```
+
+**The deletion, observed** by a watcher polling `_cat/indices` every 10 s and `_ilm/explain` every 10 min. It skips any check where Elasticsearch doesn't answer:
+```
+{"t":"2026-09-26T18:28:06Z","phase":"hot","action":"complete","age":"51.76m"}
+{"t":"2026-09-26T18:38:09Z","phase":"delete","action":"delete","age":"1.03h"}
+000001 GONE at 2026-09-26T18:38:29Z
+index                             docs.count creation.date.string
+.ds-sensor-logs-2026.09.26-000002       4256 2026-09-26T17:36:20.748Z
+.ds-sensor-logs-2026.09.26-000003       6429 2026-09-26T17:46:23.333Z
+.ds-sensor-logs-2026.09.26-000004       5729 2026-09-26T17:57:23.287Z
+.ds-sensor-logs-2026.09.26-000005       5707 2026-09-26T18:08:23.310Z
+.ds-sensor-logs-2026.09.26-000006       5714 2026-09-26T18:19:23.242Z
+.ds-sensor-logs-2026.09.26-000007       3723 2026-09-26T18:30:23.281Z
+{"generation":8,"indices":[…-000002 … -000007]}
+c5-demo-1 docs now: 0
+```
+The rollovers came every 10–11 min (17:36, 17:46, 17:57, 18:08, 18:19, 18:30), which is `max_age: 10m` plus up to one 1-minute ILM check. `-000001` lived 17:25:43 → 18:38:29, i.e. 1 h 13 min.
+**Memory with the whole stack running:** Kibana 1.73 GiB, Elasticsearch 1.01 GiB, Grafana 403 MiB, Filebeat 92 MiB, Prometheus 65 MiB, API 42 MiB. Host RAM available: 939 MiB.
+
+**A watcher mistake worth recording:** my first deletion watcher reported "000001 GONE at 17:44:36Z". That was during `docker compose down`, when Elasticsearch was unreachable, and the check "index not listed" can't tell "deleted" from "no answer". The index was still there after `up`. The watcher now skips a check when Elasticsearch doesn't answer.
+

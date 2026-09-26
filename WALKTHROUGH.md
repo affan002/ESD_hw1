@@ -32,7 +32,17 @@ Everything below was run against the live stack on 2026-09-26. Your numbers will
   - [B5. Experiments to run yourself](#b5-experiments-to-run-yourself)
   - [B6. From what you see to the report](#b6-from-what-you-see-to-the-report)
   - [B7. Check yourself](#b7-check-yourself)
-- [Glossary](#glossary) · [What Parts C–E will teach](#what-parts-ce-will-teach)
+- **Part C: logs**
+  - [C1. Concepts](#c1-the-concepts-you-need)
+  - [C2. What the app writes](#c2-layer-1-what-the-app-writes-stdout)
+  - [C3. Docker's log file](#c3-layer-2-dockers-log-file-the-buffer)
+  - [C4. Filebeat](#c4-layer-3-filebeat-collect-and-parse)
+  - [C5. Elasticsearch](#c5-layer-4-elasticsearch-store-index-retain)
+  - [C6. Kibana](#c6-layer-5-kibana-find)
+  - [C7. Experiments](#c7-experiments-to-run-yourself)
+  - [C8. From what you see to the report](#c8-from-what-you-see-to-the-report)
+  - [C9. Check yourself](#c9-check-yourself)
+- [Glossary](#glossary) · [What Parts D–E will teach](#what-parts-de-will-teach)
 
 ---
 
@@ -617,6 +627,292 @@ Prometheus, or its connection to the app. The app was fine, but nothing was scra
 
 ---
 
+# Part C — logs
+
+## C1. The concepts you need
+
+In Part B, metrics told you *that* something happened ("3 rejections per minute"). **Logs tell you *what* happened to each individual request**: which device, which field, which request ID. Part C turns the log lines the app already writes into something you can **keep, search and deliberately delete**.
+
+**The pipeline**, and what each stage is for:
+
+```
+ app/logging_setup.py        Docker json-file driver         Filebeat                    Elasticsearch               Kibana
+ one JSON object per   ──►   wraps + saves each line   ──►   collect, parse into   ──►   store + index each   ──►   search with KQL
+ line on stdout              /var/lib/docker/containers/     fields, ship (push)         field; delete old          (Discover)
+ (WRITE)                     <id>/<id>-json.log (BUFFER)     (COLLECT + PARSE)           data (STORE + RETAIN)      (FIND)
+```
+
+| Term | Meaning | Here |
+|---|---|---|
+| **Structured log** | Each line is data with named fields, not a sentence you have to parse with regexes | Our JSON lines |
+| **Document** | One stored log line in Elasticsearch | One `_source` |
+| **Index / mapping** | Where documents live; the mapping says each field's **type** (`keyword` = exact value, `text` = full-text words, numbers, dates) | `monitoring/elasticsearch/index-template.json` |
+| **Data stream** | A name you append logs to (`sensor-logs`). Behind it sit **backing indices**, `.ds-sensor-logs-<date>-000001`, `-000002`, … | |
+| **ILM** (index lifecycle management) | Rules for when to start a new backing index (**rollover**) and when to **delete** old ones: *retention* | `monitoring/elasticsearch/ilm-policy.json` |
+| **KQL** | Kibana's query language: `field : value`, `and`/`or`/`not`, `>`/`<` | `request_id : "abc"` |
+| **Push vs pull** | Prometheus *pulls* metrics from the app. Filebeat *pushes* logs to Elasticsearch, and the app knows about neither | |
+
+The big lesson: **logs are only as useful as their structure.** Because our lines are JSON with a stable `event` name and a `request_id`, Filebeat needs no parsing rules at all, and every search is a field lookup instead of a text grep.
+
+## C2. Layer 1: what the app writes (stdout)
+
+**Code:**
+- The formatter: [app/logging_setup.py:41](app/logging_setup.py#L41).
+- The whitelist of extra fields, the only fields besides the base ones that can ever reach a log: [app/logging_setup.py:15](app/logging_setup.py#L15).
+- The request ID on every line: [app/logging_setup.py:49](app/logging_setup.py#L49), set by the middleware at [app/middleware.py:37](app/middleware.py#L37).
+
+**Where each event is written:**
+
+| Event | Line |
+|---|---|
+| `http_request` | [middleware.py:96](app/middleware.py#L96) |
+| `reading_stored` | [main.py:165](app/main.py#L165) |
+| `anomaly_detected` | [main.py:176](app/main.py#L176) |
+| `reading_rejected` | [main.py:90](app/main.py#L90) |
+| `fault_injected` | [faults.py:58](app/faults.py#L58) |
+| `sim_send_failed` | [simulate.py:126](simulator/simulate.py#L126) |
+
+**Try it:** send a reading with your own ID (e.g. `-H 'X-Request-ID: me-c-1'`, from [A4.3](#a43-validation-and-anomalies-from-the-terminal)), then print its lines:
+
+```bash
+docker compose logs api --no-log-prefix | jq -c 'select(.request_id=="me-c-1")'
+```
+
+**Predict first:** how many lines will a *valid, anomalous* reading produce? And a *rejected* one? *(3: stored + anomaly + http_request. 2: rejected + http_request.)*
+
+## C3. Layer 2: Docker's log file (the buffer)
+
+Docker saves every stdout line to a file owned by root, wrapped in an **envelope**. You can't read it as your user, but the Filebeat container mounts it read-only, so read it through Filebeat.
+
+Get the full ID of the running `api` container:
+
+```bash
+CID=$(docker compose ps -q api | xargs docker inspect -f '{{.Id}}')
+```
+
+Print its last log line, as Docker stored it:
+
+```bash
+docker compose exec -T filebeat tail -1 /var/lib/docker/containers/$CID/$CID-json.log
+```
+
+You'll see `{"log":"<our JSON>\n","stream":"stdout","time":"…"}`: our line *inside* a string, plus Docker's own timestamp.
+
+**Rotation:** [docker-compose.yml](docker-compose.yml) (the `x-app-logging` anchor) caps each container at 3 files × 10 MB. Check it:
+
+```bash
+docker inspect $CID --format '{{json .HostConfig.LogConfig}}'
+```
+
+**Predict:** what happens to this file when the container is *re-created* (`docker compose up -d --force-recreate api`)? *(It's deleted with the old container, and the new container starts a new, empty file. That's why Docker's copy is only a buffer. Try it in [C7](#c7-experiments-to-run-yourself).)*
+
+## C4. Layer 3: Filebeat (collect and parse)
+
+Read [monitoring/filebeat/filebeat.yml](monitoring/filebeat/filebeat.yml) top to bottom. It's short, and every step is commented.
+
+| Lines | What it does | Why |
+|---|---|---|
+| [13–35](monitoring/filebeat/filebeat.yml#L13) | **Autodiscover** asks Docker (through `docker.sock`) which containers exist, and starts one `filestream` input per container named `esd_hw1-(api\|simulator)-N` | Only our two services; a re-created container is followed automatically |
+| [32](monitoring/filebeat/filebeat.yml#L32) | The `container` parser unwraps the envelope | `message` becomes our JSON line |
+| [39](monitoring/filebeat/filebeat.yml#L39) | `copy_fields` → `log.original` | Keeps the untouched line for the "original → stored" comparison |
+| [49](monitoring/filebeat/filebeat.yml#L49) | `decode_json_fields` → top-level fields | This is the parsing step: `event`, `request_id`, … become searchable fields |
+| [55](monitoring/filebeat/filebeat.yml#L55) | `timestamp` → `@timestamp` | Order events by when the app wrote them |
+| [67](monitoring/filebeat/filebeat.yml#L67) | `drop_fields` | Removes noise, **and the Docker labels, which contained `/home/<your name>/…`** |
+| [71–79](monitoring/filebeat/filebeat.yml#L71) | Output to data stream `sensor-logs`; Filebeat's own template off | We provide the mapping and retention ourselves |
+
+Filebeat remembers how far it has read each file in its **registry** (volume `filebeat-data`). That's why a restart doesn't re-send old lines, and why a stopped Filebeat catches up instead of losing lines.
+
+**Try it:**
+- See Filebeat's own warnings and errors (it's quiet when healthy):
+  ```bash
+  docker compose logs filebeat --no-log-prefix | jq -r 'select(.["log.level"]!="info") | .message' | tail
+  ```
+- See which inputs it started:
+  ```bash
+  docker compose logs filebeat --no-log-prefix | jq -r 'select(.message|test("filestream")) | .message' | tail -3
+  ```
+
+**What went wrong while building this**, worth knowing (docs/BUILD_LOG.md, C3):
+1. The first version matched containers by Compose *label* and silently matched **nothing**: "Enabled inputs: 0". A debug run showed that Filebeat stores `com.docker.compose.service` as nested keys. Matching on the container *name* fixed it.
+2. The first documents carried the host path `/home/muhammad-affan/…` from Docker labels. **Always look at a real stored document before trusting a pipeline.**
+
+## C5. Layer 4: Elasticsearch (store, index, retain)
+
+It's at http://localhost:9200 (localhost only; security is off, which is fine for a laptop and never acceptable for a server).
+
+Count the stored log documents:
+
+```bash
+curl -s localhost:9200/sensor-logs/_count | jq .count
+```
+
+List the backing indices behind the data stream:
+
+```bash
+curl -s 'localhost:9200/_cat/indices/.ds-sensor-logs*?v&h=index,docs.count,creation.date.string&s=index'
+```
+
+Show the retention state of each backing index:
+
+```bash
+curl -s localhost:9200/sensor-logs/_ilm/explain | jq -c '.indices[] | {index, phase, action, age}'
+```
+
+Show the mapping, i.e. each field's type:
+
+```bash
+curl -s localhost:9200/sensor-logs/_mapping | jq -c '.[].mappings.properties | map_values(.type)' | head -1
+```
+
+Find the documents for your request:
+
+```bash
+curl -s localhost:9200/sensor-logs/_search -H 'Content-Type: application/json' -d '{"query":{"term":{"request_id":"me-c-1"}}}' | jq '.hits.hits[]._source'
+```
+
+**Read the template** ([monitoring/elasticsearch/index-template.json](monitoring/elasticsearch/index-template.json)). Three details matter:
+- `"data_stream": {}` (line 3): logs are append-only.
+- `"index.lifecycle.name"` (line 12): every new backing index gets the retention policy.
+- `"dynamic": false` (line 15): only the fields listed are searchable.
+
+**Exercise: `dynamic: false` is not a privacy control.** Predict first: if a document contains an unexpected field `password`, is it searchable? Is it stored?
+
+Write a test document containing a `password` field to a throwaway data stream:
+
+```bash
+curl -s -XPOST 'localhost:9200/sensor-logs-test/_doc?refresh=true' -H 'Content-Type: application/json' -d '{"@timestamp":"2026-09-26T10:00:00Z","event":"test","password":"hunter2"}'
+```
+
+Search for it by that field:
+
+```bash
+curl -s localhost:9200/sensor-logs-test/_search -H 'Content-Type: application/json' -d '{"query":{"match":{"password":"hunter2"}}}' | jq .hits.total.value
+```
+
+Now fetch the stored document itself:
+
+```bash
+curl -s localhost:9200/sensor-logs-test/_search | jq '.hits.hits[0]._source'
+```
+
+Delete the throwaway data stream:
+
+```bash
+curl -s -XDELETE localhost:9200/_data_stream/sensor-logs-test
+```
+
+<details><summary>What happens</summary>
+
+The search returns **0 hits**, because the field isn't indexed. But `_source` still **contains `"password":"hunter2"`**. The mapping controls what you can *search*, not what's *kept*. That's why privacy is enforced where lines are written: `EXTRA_FIELDS` in the app.
+</details>
+
+**Retention, the numbers:** [ilm-policy.json](monitoring/elasticsearch/ilm-policy.json) rolls over every 10 min (line 11) and deletes a backing index 1 h after its rollover (line 17). ILM checks every minute (set by [monitoring/logs-setup.sh](monitoring/logs-setup.sh)). So logs live for about 1 h 10 min. Run the `_cat/indices` command above twice, 10 minutes apart, and watch a new `-00000N` appear. An hour later the oldest one disappears.
+
+## C6. Layer 5: Kibana (find)
+
+Open **http://localhost:5601/app/discover**. There's no login, and it opens on the **Sensor logs** data view. How to use it:
+
+| You want to… | Do this |
+|---|---|
+| Set the time window | Time picker (top right), e.g. *Last 15 minutes*. **Nothing older than about 1 h exists** (retention) |
+| Search | Type KQL in the search bar and press Enter |
+| Pick columns | In the field list on the left, hover over a field and click ⊕ (e.g. `event`, `level`, `request_id`) |
+| See one whole document | Click the ↗ (expand) icon on a row; *Table* shows each field, *JSON* the stored document |
+| See a field's values | Click a field name in the left list: top 5 values and their share |
+| Open a saved search | **Open** (folder icon) → e.g. *Rejected readings (422)* |
+| Jump from one line to all lines of its request | Expand a document, hover over the `request_id` row, and use its *Filter for value* action (a ⊕ or magnifier icon, depending on the Kibana version). Or just type `request_id : "…"` |
+
+**KQL cheat sheet:**
+
+| KQL | Meaning |
+|---|---|
+| `request_id : "me-c-1"` | exact match on a keyword field |
+| `level : ("ERROR" or "WARNING")` | either value |
+| `event : "http_request" and duration_ms > 100` | combine; numeric comparison (works because `duration_ms` is mapped as `float`) |
+| `service : "simulator" and not event : "sim_summary"` | exclude |
+| `device_id : dev-01*` | wildcard |
+| `errors.field : "humidity_pct"` | a field inside an object |
+
+**Exercises (predict, then search):**
+1. **Follow your own request.** Search `request_id : "me-c-1"`. How many documents, and which events? Compare with your C2 prediction.
+2. **Why does dev-019 fail?** Search `event : "reading_rejected"` and add the columns `errors.field` and `errors.type`. How many different reasons are there? *(3, rotating: humidity 150, a missing temperature, a future timestamp. See [simulate.py:27](simulator/simulate.py#L27).)*
+3. **Same failure, two viewpoints.** Take one rejected row's `request_id` (`sim-…`) and search for it. You'll get the API's `reading_rejected` + `http_request` **and** the simulator's `sim_send_failed`. One ID, two services.
+4. **Severity over time.** Search `level : "WARNING"`, then click the `event` field on the left. Which event produces most warnings? *(`anomaly_detected`, mostly dev-018.)*
+5. **Metrics versus logs, the same events.** Set Kibana to *Last 15 minutes* and note the number of `event : "reading_rejected"` documents. Then, in Prometheus (http://localhost:9090/query), run `sum(increase(sensor_readings_total{outcome="rejected"}[15m]))`. The two should roughly agree: the same rejections, counted once as a metric (a number) and once as logs (one document each). They won't match exactly, because `increase()` extrapolates to the edges of the window and the two windows don't start at exactly the same instant.
+
+The report's screenshots of these views, with what each shows, are in [REPORT.md § C.4–C.5](REPORT.md#c4-searching-in-kibana).
+
+## C7. Experiments to run yourself
+
+Write down a prediction for each row first. For every row, what matters is **where the log survives**.
+
+| # | Do | Predict: `docker compose logs api` / Elasticsearch? |
+|---|---|---|
+| 1 | Send `X-Request-ID: me-c-2`, then `docker compose restart api` | |
+| 2 | `docker compose up -d --force-recreate api` | |
+| 3 | `docker compose stop filebeat`, send `me-c-3`, wait 20 s, check Elasticsearch, then `docker compose start filebeat` and check again | |
+| 4 | `docker compose restart filebeat`, then count `me-c-2`'s documents | duplicates? |
+| 5 | `docker compose restart elasticsearch` (wait until it's healthy) | |
+| 6 | `docker compose stop kibana` | does ingestion stop? |
+| 7 | Come back 80 minutes after sending `me-c-2` and search for it | |
+
+<details><summary>What to expect</summary>
+
+1. Both still have it: same container, same file.
+2. `docker compose logs` has **lost** it (new container, new file). Elasticsearch still has it. This is the reason for Part C.
+3. While stopped, it's in Docker's file but not in Elasticsearch. After the start it appears: Filebeat resumes from its registry position.
+4. The same count, with no duplicates: the registry remembers what was already sent.
+5. Everything is still there (the `es-data` volume).
+6. No. Documents keep arriving (`_count` grows). Kibana is only the viewer, and it frees about 1.7 GB of RAM.
+7. Gone: retention deleted its backing index. That's working as designed, not data loss.
+</details>
+
+Experiments 2, 3, 5 and 6 are Part D material: *what happens when a component stops*.
+
+## C8. From what you see to the report
+
+| Report section | How to verify it yourself | How to change it |
+|---|---|---|
+| C.1 What's logged, and where | The event table in [C2](#c2-layer-1-what-the-app-writes-stdout); `docker compose logs api --no-log-prefix \| jq -r .event \| sort \| uniq -c` | Add or change log calls in the app. A **new field** must go into `EXTRA_FIELDS` *and* `index-template.json` |
+| C.2 Filebeat parsing | [filebeat.yml](monitoring/filebeat/filebeat.yml); compare `log.original` with the other fields of any document | Edit `filebeat.yml`, then `docker compose restart filebeat` |
+| C.3 Storage and retention | The `_cat/indices` and `_ilm/explain` commands in [C5](#c5-layer-4-elasticsearch-store-index-retain); the experiments in [C7](#c7-experiments-to-run-yourself) | Edit `ilm-policy.json`, then `docker compose up logs-setup` |
+| C.4 Kibana searches | Open each saved search | Edit `monitoring/kibana/saved-objects.ndjson`, then `docker compose up logs-setup` (it overwrites) |
+| C.5 The worked example | Repeat it with your own request ID (C2 → C3 → C5 → C6) | The example's documents are deleted by retention after about an hour, so the report's IDs won't be findable later. Its screenshots and quoted lines are the record |
+| C.6 Privacy | Plant a fake secret (e.g. an `Authorization` header) and search `_source`, as in docs/BUILD_LOG.md C6 | — |
+| Screenshots | The Discover URLs are in docs/BUILD_LOG.md C5 | Recapture with headless Chrome, and rewrite the interpretation to match what *they* show |
+
+## C9. Check yourself
+
+<details><summary>1. Why are the logs JSON instead of readable sentences?</summary>
+
+So that every field can be searched and typed without fragile parsing. A human sentence is still there, in `message`.
+</details>
+
+<details><summary>2. A log line never appears in Kibana. List the places to check, in order.</summary>
+
+1. Did the app print it? (`docker compose logs api`)
+2. Is Filebeat running, and did it start an input for that container? (its logs, "filestream starting")
+3. Did Elasticsearch reject the document, for example because of a mapping conflict? (Filebeat's logs, WARN level)
+4. Is Kibana's time range right? And has retention already deleted it?
+</details>
+
+<details><summary>3. Why must Filebeat start only after <code>logs-setup</code> has finished?</summary>
+
+The index template must exist before the first document is written. Otherwise Elasticsearch creates `sensor-logs` with guessed field types and no retention policy.
+</details>
+
+<details><summary>4. Why is <code>request_id</code> a great log field but a terrible metric label?</summary>
+
+In Elasticsearch it's one indexed value per document: cheap, and found in milliseconds. As a Prometheus label, every ID would create a new time series forever (Part E2).
+</details>
+
+<details><summary>5. Is short retention a bug?</summary>
+
+No. It's a trade-off between cost, privacy and how far back you can investigate. The demo uses about 1 hour so it can be *watched*; production would keep days or weeks, which is a one-line change.
+</details>
+
+---
+
 ## Glossary
 
 | Term | Meaning |
@@ -634,11 +930,15 @@ Prometheus, or its connection to the app. The app was fine, but nothing was scra
 | **Pull vs push** | Prometheus *pulls* metrics; in Part C, Filebeat *pushes* logs |
 | **Request ID** | One ID per request, carried in the header and on every log line |
 | **Route template** | `/devices/{device_id}` instead of `/devices/dev-017`: a bounded label value |
+| **Document / mapping** | One stored log line / the field types Elasticsearch uses for it |
+| **Data stream / backing index** | The name logs are appended to (`sensor-logs`) / the actual indices behind it (`.ds-sensor-logs-…-00000N`) |
+| **Rollover / retention (ILM)** | Starting a new backing index / deleting old ones on a schedule |
+| **KQL** | Kibana Query Language: `field : value and …` |
+| **Registry** | Filebeat's record of how far it has read each file |
 
-## What Parts C–E will teach
+## What Parts D–E will teach
 
-- **C: Logs.** We already write one JSON object per line with a `request_id`. Part C ships those lines through Filebeat (collect and parse) into Elasticsearch (store and index) and Kibana (search). The lessons: structured beats plain text, retention costs money, and personal data must never reach logs. Notice that we never log request bodies or IPs; see the whitelist at [app/logging_setup.py:15](app/logging_setup.py#L15).
-- **D: System design.** A diagram plus "follow one metric, follow one log" end to end. You've already done the metric half in [A3](#a3-follow-one-reading-through-the-code) and [B2–B4](#b2-layer-1-the-raw-metrics-page), and the failure modes in [B5](#b5-experiments-to-run-yourself) experiments 3–5.
+- **D: System design.** A diagram, plus "follow one metric, follow one log" end to end. You've done both halves: the metric in [A3](#a3-follow-one-reading-through-the-code) and [B2–B4](#b2-layer-1-the-raw-metrics-page), and the log in [C2–C6](#c2-layer-1-what-the-app-writes-stdout). You've also seen the failure modes: [B5](#b5-experiments-to-run-yourself) experiments 3–5 and [C7](#c7-experiments-to-run-yourself).
 - **E: Experiments.**
-  - **E1** is experiment 1 from B5, done carefully: a baseline, a written prediction, a fault, a recovery, and each phase run for several scrapes.
-  - **E2** deliberately adds `request_id` as a label to a test counter, and shows exercise 3's lesson at scale: the series count explodes, and removing the label doesn't delete the history.
+  - **E1** is B5's experiment 1, done carefully: a baseline, a written prediction, a fault, a recovery, and each phase run for several scrapes. The fault now shows in *both* Grafana (latency percentiles) and Kibana (`event : "fault_injected"`, slow `http_request` lines).
+  - **E2** deliberately adds `request_id` as a label to a test counter, and shows B3 exercise 3's lesson at scale: the series count explodes, and removing the label doesn't delete the history.

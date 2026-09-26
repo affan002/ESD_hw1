@@ -1,0 +1,76 @@
+{
+  "index_patterns": ["sensor-logs*"],
+  "data_stream": {},
+  "priority": 500,
+  "_meta": {
+    "description": "Log documents from the sensor-api and simulator containers, shipped by Filebeat. Field names are the app's own JSON log fields (app/logging_setup.py) plus a few Filebeat/Docker fields."
+  },
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0,
+      "index.lifecycle.name": "sensor-logs-policy"
+    },
+    "mappings": {
+      "dynamic": false,
+      "properties": {
+        "@timestamp":      { "type": "date" },
+        "level":           { "type": "keyword" },
+        "service":         { "type": "keyword" },
+        "logger":          { "type": "keyword" },
+        "event":           { "type": "keyword" },
+        "message":         { "type": "text" },
+        "request_id":      { "type": "keyword" },
+
+        "device_id":       { "type": "keyword" },
+        "reading_id":      { "type": "long" },
+        "is_anomaly":      { "type": "boolean" },
+        "anomaly_reasons": { "type": "keyword" },
+        "temperature_c":   { "type": "float" },
+        "humidity_pct":    { "type": "float" },
+        "battery_pct":     { "type": "float" },
+
+        "method":          { "type": "keyword" },
+        "path":            { "type": "keyword" },
+        "status_code":     { "type": "integer" },
+        "duration_ms":     { "type": "float" },
+
+        "errors": {
+          "properties": {
+            "field":       { "type": "keyword" },
+            "type":        { "type": "keyword" }
+          }
+        },
+        "fault":           { "type": "keyword" },
+        "delay_ms":        { "type": "integer" },
+        "error":           { "type": "keyword" },
+        "stack":           { "type": "text" },
+        "config":          { "type": "flattened" },
+        "stats":           { "type": "flattened" },
+
+        "stream":          { "type": "keyword" },
+        "container": {
+          "properties": {
+            "id":          { "type": "keyword" },
+            "name":        { "type": "keyword" },
+            "image": {
+              "properties": {
+                "name":    { "type": "keyword" }
+              }
+            }
+          }
+        },
+        "host": {
+          "properties": {
+            "name":        { "type": "keyword" }
+          }
+        },
+        "log": {
+          "properties": {
+            "original":    { "type": "keyword", "index": false, "doc_values": false }
+          }
+        }
+      }
+    }
+  }
+}

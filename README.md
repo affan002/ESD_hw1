@@ -2,7 +2,7 @@
 
 This service receives readings from simulated temperature, humidity and battery sensors. It validates each reading, stores it and flags anomalies. It's the base application for an observability assignment (Prometheus/Grafana metrics and Filebeat → Elasticsearch → Kibana logs).
 
-> Status: Part A (the API, the dashboard and the simulator) and Part B (Prometheus, Grafana and Node Exporter metrics) are complete. Logging (Filebeat/Elasticsearch/Kibana) hasn't been added yet.
+> Status: Part A (the API, the dashboard and the simulator), Part B (Prometheus, Grafana and Node Exporter metrics) and Part C (the Filebeat → Elasticsearch → Kibana log pipeline) are complete.
 
 ## Prerequisites
 
@@ -10,18 +10,19 @@ This service receives readings from simulated temperature, humidity and battery 
 - Your user must be able to talk to Docker without `sudo`. If you get `permission denied ... docker.sock`, run `sudo usermod -aG docker $USER`, then log out and back in.
 - Python 3.12. This is only needed to run the tests locally.
 - `curl`. `jq` is optional but useful.
-- Free ports on the host: **8000** (API and dashboard), **9090** (Prometheus), **3000** (Grafana) and **9100** (Node Exporter).
-- About 400 MB of free RAM for the whole stack.
+- Free ports on the host: **8000** (API and dashboard), **9090** (Prometheus), **3000** (Grafana), **9100** (Node Exporter), and **9200** (Elasticsearch) and **5601** (Kibana), which are bound to 127.0.0.1 only.
+- About **3.5 GB of free RAM** for the whole stack: Kibana uses about 1.7 GB and Elasticsearch about 1 GB. If you're short on memory, `docker compose stop kibana` frees about 1.7 GB, and logs keep flowing into Elasticsearch without it.
+- About 6 GB of disk for the images. Elasticsearch needs `vm.max_map_count` ≥ 262144 (`cat /proc/sys/vm/max_map_count`); Ubuntu 24.04's default of 1048576 is fine.
 
 ## Start
 
-Build the image and start everything: the API (which also serves the dashboard), the 20-device simulator, Prometheus, Node Exporter and Grafana:
+Build the image and start everything: the API (which also serves the dashboard), the 20-device simulator, Prometheus, Node Exporter, Grafana, Elasticsearch, Kibana, Filebeat and the one-shot `logs-setup` job. The first start downloads about 6 GB of images, and later starts take about 2 minutes because Kibana is slow to boot:
 
 ```bash
 docker compose up -d --build
 ```
 
-All five services should be up (`api`, `simulator`, `prometheus`, `node-exporter`, `grafana`), with `api` marked `(healthy)`:
+All services should be up, with `api`, `elasticsearch` and `kibana` marked `(healthy)`, and `logs-setup` shown as `Exited (0)` (it runs once and stops):
 
 ```bash
 docker compose ps
@@ -37,6 +38,8 @@ The health check should return `{"status":"ok","db":"ok"}`.
 - **Interactive API docs:** http://localhost:8000/docs
 - **Grafana:** http://localhost:3000 (no login needed to view)
 - **Prometheus:** http://localhost:9090
+- **Kibana:** http://localhost:5601 (log search; no login)
+- **Elasticsearch:** http://localhost:9200
 
 After about 3 minutes, the device list shows the misbehaving devices:
 
@@ -109,6 +112,48 @@ curl -s --get localhost:9090/api/v1/query --data-urlencode 'query=sensor_devices
 **Host metrics:** the `node-exporter` service reports CPU, memory, disk and network for the machine running Docker. It uses the host network, so it's at http://localhost:9100/metrics. Try `node_load1`, or `node_memory_MemAvailable_bytes / 1024^3`, in the Prometheus UI.
 
 Prometheus keeps its data in the `prometheus-data` volume for 7 days. `docker compose down -v` deletes it along with the app's data.
+
+### Logs (Filebeat → Elasticsearch → Kibana)
+
+The API and the simulator write one JSON object per line to stdout. **Filebeat** reads those lines from Docker's log files, parses them into fields and sends them to **Elasticsearch** (data stream `sensor-logs`). **Kibana** searches them. The configuration is all files: `monitoring/filebeat/filebeat.yml`, `monitoring/elasticsearch/*.json`, `monitoring/kibana/saved-objects.ndjson` and `monitoring/logs-setup.sh`. The `logs-setup` job applies them on every `up`.
+
+**Search in Kibana.** Open http://localhost:5601/app/discover. It opens on the **Sensor logs** data view. Set the time range (top right), then type a query (KQL) in the search bar:
+
+| Find | KQL |
+|---|---|
+| Everything for one request | `request_id : "<id>"`. The ID is in the `X-Request-ID` response header, or shown by the dashboard's *Send a test reading* box |
+| Warnings and errors | `level : ("ERROR" or "WARNING")` |
+| Why readings were rejected | `event : "reading_rejected"` (add the columns `errors.field` and `errors.type`) |
+| Slow requests | `event : "http_request" and duration_ms > 100` |
+| One device | `device_id : "dev-019"` |
+
+Seven saved searches are under **Discover → Open** (the folder icon): *Errors and warnings*, *Server errors (5xx)*, *Slow requests*, *Rejected readings*, *Anomalies*, *Fault injection* and *Simulator send failures*.
+
+**Or search from the terminal.** Count the stored log documents:
+
+```bash
+curl -s localhost:9200/sensor-logs/_count | jq .count
+```
+
+Find every log line for one request (replace `my-id-1` with your request ID):
+
+```bash
+curl -s localhost:9200/sensor-logs/_search -H 'Content-Type: application/json' -d '{"query":{"term":{"request_id":"my-id-1"}}}' | jq -c '.hits.hits[]._source | {"@timestamp", level, event, message}'
+```
+
+Remember that logs older than about an hour have been deleted by retention (below), so search for something recent.
+
+**Retention.** Logs are kept for about 1 hour: the ILM policy `sensor-logs-policy` starts a new backing index every 10 minutes and deletes each one an hour after that. This is deliberately short so you can watch it happen. To see the backing indices:
+
+```bash
+curl -s 'localhost:9200/_cat/indices/.ds-sensor-logs*?v&h=index,docs.count,creation.date.string&s=index'
+```
+
+**Filebeat's own status**, useful when logs stop appearing:
+
+```bash
+docker compose logs filebeat --no-log-prefix | jq -r 'select(.["log.level"]!="info") | .message' | tail
+```
 
 ### Run the device simulator
 
@@ -283,21 +328,23 @@ Run these steps after `docker compose up -d --build`. Each step says what you sh
    ```
    Click **Turn off** in the banner. The banner disappears and the latency drops back to a few ms.
 8. **Data persists.** Note dev-001's reading count, run `docker compose restart api`, and check again. The count keeps growing from where it was instead of starting from zero.
-9. **Prometheus scrapes all targets.** This lists `node up`, `prometheus up` and `sensor-api up`:
+9. **Logs reach Kibana.** Send a reading with your own request ID (step 3 of this list, or any command in WALKTHROUGH § A4.3), then search `request_id : "<your id>"` in Kibana. It shows the reading's 2–3 log lines within a few seconds.
+10. **Logs outlive the container.** Run `docker compose up -d --force-recreate api`. `docker compose logs api | grep <your id>` now finds nothing, but the Kibana search still finds every line.
+11. **Prometheus scrapes all targets.** This lists `node up`, `prometheus up` and `sensor-api up`:
    ```bash
    curl -s localhost:9090/api/v1/targets | jq -r '.data.activeTargets[] | "\(.labels.job) \(.health)"'
    ```
-10. **Grafana dashboards have data.** Open http://localhost:3000/d/sensor-service. After about a minute (the rate window), *Stored readings / s* shows about 3.9, *p95 latency* about 20 ms, and *Devices by status* matches the API. Then open http://localhost:3000/d/node-host. *Hostname* shows the machine running Docker, and the CPU, memory, disk and network panels have data.
+12. **Grafana dashboards have data.** Open http://localhost:3000/d/sensor-service. After about a minute (the rate window), *Stored readings / s* shows about 3.9, *p95 latency* about 20 ms, and *Devices by status* matches the API. Then open http://localhost:3000/d/node-host. *Hostname* shows the machine running Docker, and the CPU, memory, disk and network panels have data.
 
 ## Clean up
 
-Stop the containers. Stored data is kept in the volumes: `sensor-data` (readings), `prometheus-data` (metrics history) and `grafana-data` (Grafana's internal state):
+Stop the containers. Stored data is kept in the volumes: `sensor-data` (readings), `prometheus-data` (metrics history), `grafana-data` (Grafana's internal state), `es-data` (the indexed logs) and `filebeat-data` (Filebeat's read positions):
 
 ```bash
 docker compose down
 ```
 
-Stop the containers **and delete all stored data**: readings, metrics history and Grafana state. The dashboards themselves are files in `monitoring/grafana/dashboards/`, so they come back on the next start. This can't be undone:
+Stop the containers **and delete all stored data**: readings, metrics history, Grafana state and all logs. The dashboards themselves are files in `monitoring/grafana/dashboards/`, so they come back on the next start. This can't be undone:
 
 ```bash
 docker compose down -v
@@ -312,5 +359,5 @@ docker image rm sensor-api:dev
 Remove the downloaded monitoring images:
 
 ```bash
-docker image rm prom/prometheus:v3.15.0 prom/node-exporter:v1.12.1 grafana/grafana:13.2.2
+docker image rm prom/prometheus:v3.15.0 prom/node-exporter:v1.12.1 grafana/grafana:13.2.2 elasticsearch:9.5.3 kibana:9.5.3 elastic/filebeat:9.5.3 curlimages/curl:8.16.0
 ```

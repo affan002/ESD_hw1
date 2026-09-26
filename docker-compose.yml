@@ -1,3 +1,12 @@
+# Docker's json-file log driver with rotation: at most 3 files x 10 MB per
+# container. Filebeat (Part C) reads these files; they're a short-term buffer,
+# and Elasticsearch is the long-term store.
+x-app-logging: &app-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   api:
     build: .
@@ -16,6 +25,7 @@ services:
       timeout: 3s
       retries: 10
       start_period: 5s
+    logging: *app-logging
 
   simulator:
     image: sensor-api:dev
@@ -28,6 +38,7 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    logging: *app-logging
 
   # ---------- Metrics (Part B) ----------
 
@@ -83,7 +94,81 @@ services:
     depends_on:
       - prometheus
 
+  # ---------- Logs (Part C) ----------
+
+  # Single-node Elasticsearch for the log pipeline. Security is off for local
+  # use, so the port is bound to 127.0.0.1 only (not reachable from the LAN).
+  elasticsearch:
+    image: elasticsearch:9.5.3
+    environment:
+      discovery.type: single-node
+      cluster.name: sensor-logs
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms512m -Xmx512m
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=2s' >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  # Search UI for the logs. Data view and saved searches are imported by
+  # logs-setup from monitoring/kibana/saved-objects.ndjson (no clicking).
+  kibana:
+    image: kibana:9.5.3
+    environment:
+      ELASTICSEARCH_HOSTS: '["http://elasticsearch:9200"]'
+      TELEMETRY_OPTIN: "false"
+      NEWSFEED_ENABLED: "false"
+      TELEMETRY_ALLOWCHANGINGOPTINSTATUS: "false"  # with optIn=false this hides the "Help us improve" banner
+    ports:
+      - "127.0.0.1:5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:5601/api/status | grep -q '\"overall\":{\"level\":\"available\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # One-shot job: retention policy + index template in Elasticsearch, then the
+  # Kibana data view and saved searches. Idempotent; exits when done.
+  logs-setup:
+    image: curlimages/curl:8.16.0
+    entrypoint: ["/bin/sh", "/monitoring/logs-setup.sh"]
+    volumes:
+      - ./monitoring:/monitoring:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: "no"
+
+  # Tails the api and simulator containers' Docker log files and ships them to
+  # Elasticsearch. Runs as root (Docker's log files are root-only) with
+  # read-only mounts; --strict.perms=false because the config file is owned by
+  # the host user, not root.
+  filebeat:
+    image: elastic/filebeat:9.5.3
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      - ./monitoring/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - filebeat-data:/usr/share/filebeat/data
+    depends_on:
+      logs-setup:
+        condition: service_completed_successfully
+
 volumes:
   sensor-data:
   prometheus-data:
   grafana-data:
+  es-data:
+  filebeat-data:

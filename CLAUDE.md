@@ -4,11 +4,11 @@ Conventions for this repo. Keep them consistent, and update this file only when 
 
 ## Project
 - IoT sensor ingestion API, plus a device simulator. It's the base app for an observability assignment (Parts A–E).
-- **Parts A (API, dashboard and simulator) and B (Prometheus, Grafana, Node Exporter) are complete and verified.** Parts C–E (Filebeat/ES/Kibana, the experiments) have not started. Don't add ELK or the experiment code (such as a `request_id`-labelled counter) until asked.
+- **Parts A (API, dashboard and simulator), B (Prometheus, Grafana, Node Exporter) and C (Filebeat → Elasticsearch → Kibana) are complete and verified.** Parts D–E (system design, the experiments) have not started. Don't add the experiment code (such as a `request_id`-labelled counter) until asked.
 - Living docs, updated stage by stage after each stage's done check passes:
   - `REPORT.md`: **concise**, answering exactly what each part of the assignment asks, in short paragraphs and tables. The style is `A. Project`, `B.1 …` numbered subsections, and conclusions with the key numbers only. Aim for about 50–100 lines per part. No stage-by-stage logs.
   - `WALKTHROUGH.md`: a **learning guide for the author**, not a reference. Each part has concept, code pointers (`[file:line](file#Lline)`), exercises (predict, then run), how to read the dashboards, and check-yourself questions. When code moves, update its line links (check with `grep -n`). When a part is finished, add its section in the same style.
-  - Screenshots go in `docs/screenshots/`, named with a part prefix (`a_…`, `b_…`). Capture them with `scripts/capture_screenshots.sh`, which uses headless Chrome, a fixed absolute time window (never `now`, because virtual time makes graphs dip at the right edge) and the light theme. Every screenshot in the report needs an interpretation of what it actually shows, not just a caption.
+  - Screenshots go in `docs/screenshots/`, named with a part prefix (`a_…`, `b_…`, `c_…`). Kibana screenshots use Discover URLs with `_g=(time:(from:'…Z',to:'…Z'))` and `_a=(dataSource:(dataViewId:sensor-logs,type:dataView),query:(language:kuery,query:'…'))`, captured with headless Chrome using `--virtual-time-budget=40000`. If the file size doesn't change after a capture, it failed (Kibana wasn't ready). Capture them with `scripts/capture_screenshots.sh`, which uses headless Chrome, a fixed absolute time window (never `now`, because virtual time makes graphs dip at the right edge) and the light theme. Every screenshot in the report needs an interpretation of what it actually shows, not just a caption.
   - `docs/BUILD_LOG.md`: the stage-by-stage evidence (what was built, the exact command, the trimmed real output). Append a section per stage here; the report links to it.
   - `README.md`: start/use/test/clean up. It must always match what runs right now.
   - `CLAUDE.md`: this file.
@@ -133,6 +133,23 @@ Conventions for this repo. Keep them consistent, and update this file only when 
 - Create every known label combination at startup (see the loop in `metrics.py`), so series exist at 0.
 - The image sets `PROMETHEUS_DISABLE_CREATED_SERIES=True`, so there are no `*_created` series.
 - Tests: metrics accumulate in the process-wide registry, so assert on deltas (`after - before`) with `REGISTRY.get_sample_value`, never on absolute values.
+
+## Logs pipeline (Part C)
+- Images pinned to the same version: `elasticsearch:9.5.3`, `kibana:9.5.3`, `elastic/filebeat:9.5.3`, plus `curlimages/curl:8.16.0` for the setup job. Keep all three Elastic images on one version. No Logstash.
+- Ports: Elasticsearch **127.0.0.1:9200**, Kibana **127.0.0.1:5601**. They're bound to localhost because security is off (`xpack.security.enabled=false`). Never publish them on 0.0.0.0.
+- Elasticsearch is a single node with heap `-Xms512m -Xmx512m` and volume `es-data`. The whole stack needs about 3.5 GB of RAM (Kibana about 1.7 GB), and `docker compose stop kibana` doesn't stop ingestion.
+- **Config lives in `monitoring/`:**
+  - `filebeat/filebeat.yml`: Docker autodiscover on `container.name` regexp `^esd_hw1-(api|simulator)-[0-9]+$`. Label conditions don't match, because Filebeat nests the dotted label keys. The `container` parser unwraps Docker's envelope; the processors run `copy_fields` → `decode_json_fields` → `timestamp` → `drop_fields`.
+  - `elasticsearch/index-template.json`: data stream `sensor-logs`, pattern `sensor-logs*`, 1 shard / 0 replicas, `dynamic: false` with explicit types.
+  - `elasticsearch/ilm-policy.json`: `sensor-logs-policy`.
+  - `kibana/saved-objects.ndjson`: data view id `sensor-logs` and the saved searches, with ids `sensor-<slug>`.
+  - `logs-setup.sh`: run by the one-shot `logs-setup` service. It's idempotent; `filebeat` waits for it to finish (`service_completed_successfully`).
+- **Index and field naming:** documents go to the data stream `sensor-logs` (backing indices `.ds-sensor-logs-<date>-00000N`). Field names are the app's own log fields at the top level (`event`, `level`, `request_id`, …), plus `container.{id,name,image.name}`, `host.name`, `stream`, and `log.original` (the raw line, stored but not indexed). When the app logs a **new field**, add it to `EXTRA_FIELDS` *and* to `index-template.json` (otherwise it's stored but not searchable), then re-run `docker compose up logs-setup`. The template only applies to the next backing index, i.e. from the next rollover.
+- **Never add Docker labels or env vars to documents.** The `docker` object that autodiscover attaches includes the host's working directory (`/home/<user>/…`), so `drop_fields` must keep dropping `docker` and `container.labels`.
+- **Retention (the ILM policy chosen):** roll over at `max_age: 10m` (or 1 GB); delete 1 h after rollover; the ILM poll interval is set to `1m` by `logs-setup`. So logs live for about 1 h 10 min. This is deliberately short for the demo; don't use "old" request IDs in docs or examples, because they get deleted.
+- Docker log rotation for `api` and `simulator` uses the `x-app-logging` anchor: `json-file`, 3 × 10 MB.
+- Checking what's stored: `exists` / `query_string` only see *indexed* fields. To prove a value is absent, scan `_source` (see docs/BUILD_LOG.md C6).
+- Kibana: env settings must be on the Docker image's allowed list. The banner is hidden with `TELEMETRY_OPTIN=false` plus `TELEMETRY_ALLOWCHANGINGOPTINSTATUS=false`.
 
 ## Code rules
 - All output goes through `logging`. Never use `print()`.

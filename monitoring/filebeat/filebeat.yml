@@ -1,0 +1,83 @@
+# Filebeat: ship the JSON logs of the `api` and `simulator` containers to
+# Elasticsearch. Mounted read-only at /usr/share/filebeat/filebeat.yml.
+#
+# Path of one log line:
+#   app prints JSON to stdout
+#   -> Docker's json-file driver wraps it: {"log":"<our JSON>\n","stream":"stdout","time":"..."}
+#      in /var/lib/docker/containers/<id>/<id>-json.log
+#   -> Filebeat (below) unwraps, parses and ships it to the `sensor-logs` data stream.
+
+# Discover containers through the Docker API (docker.sock, read-only) and start
+# one input per matching container. A re-created container gets a new id and
+# is picked up automatically.
+filebeat.autodiscover:
+  providers:
+    - type: docker
+      templates:
+        # Match only this project's api and simulator containers by name.
+        # Compose names containers <project>-<service>-<n>, e.g. esd_hw1-api-1.
+        # (Label conditions don't work reliably here: Filebeat nests the dotted
+        # compose label keys, e.g. container.labels.com.docker.compose.project.value.)
+        - condition:
+            regexp:
+              container.name: "^esd_hw1-(api|simulator)-[0-9]+$"
+          config:
+            - type: filestream
+              id: container-${data.docker.container.id}
+              paths:
+                - /var/lib/docker/containers/${data.docker.container.id}/*-json.log
+              parsers:
+                # Unwraps Docker's {"log","stream","time"} envelope: `message`
+                # becomes our JSON line, `stream` = stdout/stderr.
+                - container:
+                    stream: all
+                    format: docker
+
+processors:
+  # 1. Keep the untouched original line, for the "original -> stored" example
+  #    and for debugging a parse problem. Stored, not indexed (see index-template.json).
+  - copy_fields:
+      fields:
+        - from: message
+          to: log.original
+      fail_on_error: false
+      ignore_missing: true
+  # 2. Parse our JSON into top-level fields (event, request_id, level, ...).
+  #    Our `message` (the human sentence) replaces the raw line.
+  #    add_error_key is off: its `error.*` object would clash with our own
+  #    `error` string field. A non-JSON line simply keeps its raw `message`.
+  - decode_json_fields:
+      fields: ["message"]
+      target: ""
+      overwrite_keys: true
+      add_error_key: false
+  # 3. Use the app's own timestamp as the event time, not the time Filebeat read it.
+  - timestamp:
+      field: timestamp
+      layouts:
+        - "2006-01-02T15:04:05.000Z"
+      test:
+        - "2026-09-26T10:00:00.123Z"
+      ignore_missing: true
+      ignore_failure: true
+  # 4. Drop what we don't need: the now-duplicate `timestamp`, Beat bookkeeping,
+  #    and Docker labels, which include host paths such as /home/<user>/...
+  #    (container.name/id/image stay).
+  #    Nothing here adds data: no processor reads request bodies, headers or env vars.
+  - drop_fields:
+      fields: ["timestamp", "agent", "ecs", "input", "log.file", "log.offset", "container.labels", "docker"]
+      ignore_missing: true
+
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  # Filebeat writes with the `create` action, so this name auto-creates the data
+  # stream from our index template (created beforehand by the logs-setup service).
+  index: "sensor-logs"
+
+# The index template and retention policy are ours (monitoring/elasticsearch/),
+# so Filebeat must not install its own.
+setup.template.enabled: false
+setup.ilm.enabled: false
+
+logging.level: info
+logging.metrics.enabled: false

@@ -243,7 +243,133 @@ Its values matched the host's own tools:
 
 ## C. Logs
 
-_Not started._
+The pipeline: the app writes JSON to stdout → Docker saves it → Filebeat reads and parses it → Elasticsearch stores it → Kibana searches it. Everything is configured from files in `monitoring/` (`filebeat/`, `elasticsearch/`, `kibana/`, `logs-setup.sh`), with nothing clicked together. The images are Elastic 9.5.3; Logstash isn't used.
+
+### C.1 What is logged, why, and where
+
+`app/logging_setup.py` writes **one JSON object per line** to stdout. Every line has `timestamp` (UTC), `level`, `service`, `logger`, `event` (a fixed machine name), `message` (a human sentence) and `request_id`. The middleware takes the request ID from the client's `X-Request-ID` header, or generates one. It's stored in a context variable, so every line written while handling a request carries it.
+
+| Event | Level | Extra fields | Emitted in | Why |
+|---|---|---|---|---|
+| `http_request` | INFO (ERROR if 5xx) | method, path (route template), status_code, duration_ms | `app/middleware.py:96` | one line per request: traffic, latency, failures |
+| `reading_stored` · `device_registered` | INFO | device_id, reading_id, is_anomaly | `app/main.py:165`, `:161` | the trail of each accepted reading |
+| `anomaly_detected` | WARNING | device_id, reading_id, anomaly_reasons, the 3 values | `app/main.py:176` | which device and which reading triggered an alarm |
+| `reading_rejected` | WARNING | errors = [{field, type}], device_id if valid | `app/main.py:90` | why a reading was rejected, **without the submitted values** |
+| `fault_config_changed` · `fault_injected` | WARNING / ERROR | config, fault, delay_ms | `app/main.py:238`, `app/faults.py:58` | marks when an experiment was running |
+| `unhandled_exception` | ERROR | error, stack | `app/middleware.py:62` | crashes, with a traceback |
+| `startup` · `sim_startup` · `sim_summary` · `sim_send_failed` | INFO / WARNING | config, stats, status_code, fault | `app/main.py:61`, `simulator/simulate.py:126–155` | restarts, and the client's view of failures |
+
+**Not logged:** request bodies, headers (`Authorization`, cookies), query strings, client IPs, and the values of rejected fields. Only the fields on the whitelist in `EXTRA_FIELDS` (`app/logging_setup.py:15`) are ever emitted, so anything else is dropped before a line is written. C.6 tests this through the whole pipeline.
+
+### C.2 How Filebeat collects logs and turns them into fields
+
+Docker's `json-file` driver wraps each stdout line as `{"log":"<our JSON>\n","stream":"stdout","time":"…"}` and writes it to `/var/lib/docker/containers/<id>/<id>-json.log`. Filebeat (`monitoring/filebeat/filebeat.yml`) mounts that directory and the Docker socket **read-only**:
+
+1. **Autodiscover (docker)** starts a `filestream` input only for containers named `esd_hw1-(api|simulator)-N`. A re-created container is followed automatically; the new container's lines appeared within about 6 s.
+2. **The `container` parser** unwraps Docker's envelope: `message` = our JSON line, `stream` = stdout.
+3. **`copy_fields`** keeps the untouched line in `log.original`.
+4. **`decode_json_fields`** parses `message` into top-level fields (`event`, `request_id`, `duration_ms`, …). Our human sentence becomes `message`.
+5. **`timestamp`** sets `@timestamp` from *our* `timestamp`, so events are ordered by when the app wrote them, not when Filebeat read them.
+6. **`drop_fields`** removes Beat bookkeeping and Docker labels. The labels contained the host path `/home/<user>/…`, i.e. my name, which I found in the first stored documents (C.6).
+7. The output is the **data stream `sensor-logs`**. Its index template (`monitoring/elasticsearch/index-template.json`, installed by the one-shot `logs-setup` service before Filebeat starts) maps 29 fields with explicit types: `keyword` for `event`, `level`, `request_id`, `device_id`; numbers for `duration_ms`, `status_code`, `temperature_c`. It uses `dynamic: false`, so an unexpected field is kept in the document but never becomes a new searchable field.
+
+No text parsing is needed: the app writes JSON, and Filebeat decodes JSON.
+
+### C.3 Where logs live, what survives restarts, and when they're deleted
+
+| Stage | Where | Survives `restart` | Survives container re-creation / `down` | Deleted when |
+|---|---|---|---|---|
+| Docker's log file | `/var/lib/docker/containers/<id>/*-json.log` | yes | **no**, it belongs to the container | rotation at 3 × 10 MB (`x-app-logging`), or when the container is removed |
+| Filebeat's read position | volume `filebeat-data` (registry) | yes | yes (not `down -v`) | — |
+| Indexed documents | volume `es-data`, data stream `sensor-logs` → backing indices `.ds-sensor-logs-<date>-00000N` | yes | yes (not `down -v`) | **ILM `sensor-logs-policy`: a new backing index every 10 min, each deleted 1 h after its rollover** |
+
+All of these were tested (docs/BUILD_LOG.md, stage C7):
+- After `up --force-recreate api`, `docker compose logs` no longer contained request `c5-demo-1` (3 → 0 lines), but Elasticsearch still returned all 3 documents.
+- Restarting Filebeat created no duplicates.
+- A reading logged while Filebeat was stopped for 20 s appeared as soon as it started again.
+
+Retention is deliberately short so it can be demonstrated:
+- `.ds-sensor-logs-2026.09.26-000001` was created at 17:25:43 and rolled over at **17:36:20** (10 min + the 1-minute ILM check interval).
+- `-000002` rolled over at 17:46:23.
+- **`-000001` was deleted at 18:38:29**: ILM moved it to the delete phase at 18:38:09, 1.03 h after its rollover, and it was gone 20 s later. It lived 1 h 13 min in total. Its documents went with it: searching `request_id : "c5-demo-1"` (C.5) now returns 0, and the screenshots below are that example's only record.
+
+So logs are kept for about 1 h 10 min. Production would use days (e.g. roll over daily, delete after 7 d), which is a one-line change in `ilm-policy.json`.
+
+### C.4 Searching in Kibana
+
+Kibana (http://localhost:5601, bound to localhost only) opens Discover on the provisioned data view **Sensor logs** (`sensor-logs`, time field `@timestamp`). The **7 saved searches** in `monitoring/kibana/saved-objects.ndjson` are imported by `logs-setup`:
+
+| Saved search | KQL |
+|---|---|
+| Errors and warnings | `level : ("ERROR" or "WARNING")` |
+| Server errors (5xx) | `event : "http_request" and status_code >= 500` |
+| Slow requests (> 100 ms) | `event : "http_request" and duration_ms > 100` |
+| Rejected readings (422) | `event : "reading_rejected"` |
+| Anomalies | `event : "anomaly_detected"` |
+| Fault injection | `event : ("fault_injected" or "fault_config_changed")` |
+| Simulator send failures | `service : "simulator" and event : "sim_send_failed"` |
+
+- **To follow one request:** `request_id : "<id>"`. The ID comes from the `X-Request-ID` response header, the dashboard's result box, or the simulator's own log line.
+- **To see everything from one device:** `device_id : "dev-019"`.
+
+![Kibana: all WARNING logs over 10 minutes](docs/screenshots/c_kibana_warnings.png)
+
+*Searching by severity: `level : "WARNING"` over 10 minutes (22:26–22:36 PKT, 17:26–17:36 UTC) returns **275** lines. Kibana's field aggregations break them down:*
+- **177 `anomaly_detected`:** mostly dev-018 (low battery) and dev-017 (overheating).
+- **43 `reading_rejected`:** 42 from dev-019's bad data, plus 1 from my privacy test (C.6).
+- **55 `sim_send_failed`:** the simulator's side. 42 are the same dev-019 rejections seen from the client, and **13 are `ConnectError`s**.
+
+The histogram is otherwise flat at 2–6 warnings per 10 s. Its peak (12 at 22:30:10) is those `ConnectError`s: that's when I restarted the API (C.3), and the simulator's readings failed to connect for a few seconds. Logs from both services, side by side, tell that story.
+
+![Kibana: the "Rejected readings" saved search](docs/screenshots/c_kibana_rejected_saved_search.png)
+
+*The saved search **Rejected readings (422)**, with the columns `device_id`, `errors.field`, `errors.type` and `request_id`.* 42 of the 43 rows are dev-019, and the reasons rotate: `timestamp · timestamp_in_future`, `temperature_c · missing`, `humidity_pct · less_than_equal`. The one exception is my own test reading as dev-100. An integrator would see exactly what's wrong with their payloads, and the values they sent are never shown. Each row's `request_id` (`sim-…`) leads to the matching simulator line.
+
+### C.5 Worked example: one log line from the app to a Kibana search
+
+**1. The app writes it**: `anomaly_detected` for `POST /readings` with `X-Request-ID: c5-demo-1` and 41.5 °C:
+```json
+{"timestamp": "2026-09-26T17:28:33.009Z", "level": "WARNING", "service": "sensor-api", "logger": "app", "event": "anomaly_detected", "message": "anomaly detected: temperature_high", "request_id": "c5-demo-1", "device_id": "dev-100", "reading_id": 116760, "anomaly_reasons": ["temperature_high"], "temperature_c": 41.5, "humidity_pct": 45.0, "battery_pct": 88.0}
+```
+**2. Docker saves it** in `/var/lib/docker/containers/aff99987…/aff99987…-json.log`:
+```json
+{"log":"{\"timestamp\": \"2026-09-26T17:28:33.009Z\", … \"battery_pct\": 88.0}\n","stream":"stdout","time":"2026-09-26T17:28:33.01002747Z"}
+```
+**3. Elasticsearch stores it** in `.ds-sensor-logs-2026.09.26-000001` as a flat document. Every field is separate and typed, and the original line is kept in `log.original` (stored, not indexed):
+
+![Kibana: the stored document, field by field](docs/screenshots/c_kibana_document.png)
+
+*The stored document, field by field.* Taking the fields in groups:
+- **`@timestamp`** (22:28:33.009 PKT) is the app's time, not Docker's (…33.010).
+- **Our fields** (`level`, `event`, `request_id`, `device_id`, `anomaly_reasons`, the values) came from `decode_json_fields`.
+- **`container.*`** came from autodiscover, and `stream` from the container parser.
+- **`log.original`** is step 1 unchanged.
+- **Nothing about the host user** remains; the Docker labels were dropped.
+
+**4. Kibana finds it:** `request_id : "c5-demo-1"`
+
+![Kibana: search by request_id](docs/screenshots/c_kibana_request_id.png)
+
+*Searching `request_id : "c5-demo-1"` returns **exactly 3 documents**: every line the service wrote for that one request.* In order:
+1. `reading_stored` (INFO)
+2. `anomaly_detected` (WARNING)
+3. `http_request` `POST /readings -> 201`, with `duration_ms` 6.53
+
+This is the question metrics can't answer: *what happened to this particular request?* Even after the API container was re-created and `docker compose logs` had lost these lines, the same search still found all 3.
+
+### C.6 No secrets or personal data
+
+I sent requests containing fake secrets:
+- an `Authorization: Bearer …` header and a `Cookie` header,
+- extra body fields `password` and `owner_email`,
+- a password in a rejected body,
+- a `?token=…` query string.
+
+Then I scanned the `_source` of **all 11,343 stored documents** (including `log.original`) and the raw Docker logs. **Every planted value was found 0 times**, as were the words `Bearer`, `password` and `/home/`.
+
+Two lessons came out of this:
+- **The Filebeat processors only copy, parse or drop; none adds data.** The one leak I found came from Filebeat's own Docker metadata (the home path, C.2), and it's now dropped.
+- **Elasticsearch's `dynamic: false` is not a privacy control.** A test document with a `password` field wasn't searchable, but it was still stored. Privacy has to be enforced where the log line is written: the app's whitelist.
 
 ## D. System design
 
@@ -258,4 +384,4 @@ _Not started._
 ## Credits and AI assistance
 
 - Written with the help of Claude Code (Anthropic). I reviewed, ran and verified every command and output recorded here.
-- Libraries and tools: FastAPI, Uvicorn, Pydantic, httpx, pytest, prometheus_client, Prometheus, Grafana, Node Exporter.
+- Libraries and tools: FastAPI, Uvicorn, Pydantic, httpx, pytest, prometheus_client, Prometheus, Grafana, Node Exporter, Filebeat, Elasticsearch, Kibana.

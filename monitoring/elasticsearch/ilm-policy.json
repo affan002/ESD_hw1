@@ -1,0 +1,24 @@
+{
+  "policy": {
+    "_meta": {
+      "description": "Retention for the sensor-logs data stream. Deliberately short so it can be demonstrated: a new backing index every 10 minutes, each deleted 1 hour after it was rolled over (so logs are kept for roughly 1h-1h10m). A production value would be days, e.g. rollover 1d and delete after 7d."
+    },
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_age": "10m",
+            "max_primary_shard_size": "1gb"
+          }
+        }
+      },
+      "delete": {
+        "min_age": "1h",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
