@@ -4,7 +4,6 @@ Enterprise Software Development, Fall 2026, Assignment 1. Individual submission 
 
 - **Code and config:** everything is in this repository.
 - **Start, use, test and clean up:** [README.md](README.md).
-- **Learning guide:** [WALKTHROUGH.md](WALKTHROUGH.md) explains the concepts, follows the code, gives exercises, and shows how to read the dashboards.
 - **Raw evidence:** every command and output behind the numbers below is in [docs/BUILD_LOG.md](docs/BUILD_LOG.md).
 
 ---
@@ -51,9 +50,9 @@ Every request carries an `X-Request-ID`, and every event is written as one JSON 
 - dev-019's bad readings are rejected and never stored (12 of 713 in 3 min).
 - dev-020 turns `stale` about 30 s after it goes silent.
 - Data survives restarts.
-- 83 tests pass.
+- 86 tests pass.
 
-A hands-on guide to the app and its API is in [WALKTHROUGH.md § A4](WALKTHROUGH.md#a4-use-it-yourself). Known limits: single-node SQLite, no authentication (including `/admin/faults`), and fixed thresholds only.
+How to use the API and dashboard is in [README.md](README.md#use). Known limits: single-node SQLite, no authentication (including `/admin/faults`), and fixed thresholds only.
 
 ![Operator dashboard at http://localhost:8000](docs/screenshots/a_operator_dashboard.png)
 

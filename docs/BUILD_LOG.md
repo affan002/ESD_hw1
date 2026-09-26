@@ -715,7 +715,7 @@ _source.password                            "hunter2" (but still STORED)
 
 **Problems found and fixed:**
 1. **No inputs started.** A condition on `docker.container.labels.com_docker_compose_service` never matched. A debug run (`-d autodiscover`) showed that Filebeat nests the dotted label keys (`container.labels.com.docker.compose.project.value`), and `labels.dedot: true` didn't change that. The fix was to match on the name Compose gives each container: `regexp: container.name: "^esd_hw1-(api|simulator)-[0-9]+$"`. Then: `Input 'filestream' starting` ×2, and `Connection to backoff(elasticsearch(http://elasticsearch:9200)) established`.
-2. **Personal data in every document.** Autodiscover attached `docker.container.labels`, including `com_docker_compose_project_working_dir: /home/muhammad-affan/…`, which is the user's name. I added `docker` to `drop_fields`, then deleted the data stream and the Filebeat registry so everything was re-ingested from Docker's log files.
+2. **Personal data in every document.** Autodiscover attached `docker.container.labels`, including `com_docker_compose_project_working_dir: /home/<user>/…`, which contains the user's name. I added `docker` to `drop_fields`, then deleted the data stream and the Filebeat registry so everything was re-ingested from Docker's log files.
 
    I also found that a check using `exists`/`query_string` returned 0 even while the field was present, because those queries only see *indexed* fields. The reliable check is to scan `_source`:
 ```
@@ -1031,7 +1031,7 @@ restarted: after 20 s, devices {"ok":20,"stale":1}   (dev-100 = a manual test de
 
 The first render used `flowchart LR` and was 2382×696, unreadable when scaled to page width. The switch to `TB` gives 3235×4925 at 2×.
 
-**Simplified afterwards.** The version with a failure note in every box was too dense to read at a glance. The diagram now shows only the components, their groups (Clients, sensor-api, Metrics, Logs, plus the one-shot logs-setup) and one short label per arrow, drawn `LR` at 3540×1233 (2×). The failure behaviour and the storage and retention detail moved to REPORT D.1–D.2, where they were already listed as tables. The `docker.sock` and "Filebeat waits for logs-setup" arrows were dropped from the drawing; they're described in D.1's text and the walkthrough.
+**Simplified afterwards.** The version with a failure note in every box was too dense to read at a glance. The diagram now shows only the components, their groups (Clients, sensor-api, Metrics, Logs, plus the one-shot logs-setup) and one short label per arrow, drawn `LR` at 3540×1233 (2×). The failure behaviour and the storage and retention detail moved to REPORT D.1–D.2, where they were already listed as tables. The `docker.sock` and "Filebeat waits for logs-setup" arrows were dropped from the drawing; they're described in D.1's text.
 ```
 $ scripts/render_diagram.sh
 wrote docs/diagrams/architecture.svg

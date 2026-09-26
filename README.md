@@ -358,8 +358,6 @@ python3.12 -m venv .venv
 
 ### Manual check (about 5 minutes)
 
-To understand *why* each check behaves the way it does, see [WALKTHROUGH.md](WALKTHROUGH.md). It's a learning guide that follows a reading through the code line by line, gives hands-on exercises (predict first, then run), explains how to read every Grafana panel, and maps each section of the report to how you can check it yourself.
-
 Run these steps after `docker compose up -d --build`. Each step says what you should see.
 
 1. **Health.** `curl -s localhost:8000/health` returns `{"status":"ok","db":"ok"}`, and `docker compose ps` shows `api` as `(healthy)`.
@@ -390,7 +388,7 @@ Run these steps after `docker compose up -d --build`. Each step says what you sh
    ```
    Click **Turn off** in the banner. The banner disappears and the latency drops back to a few ms.
 8. **Data persists.** Note dev-001's reading count, run `docker compose restart api`, and check again. The count keeps growing from where it was instead of starting from zero.
-9. **Logs reach Kibana.** Send a reading with your own request ID (step 3 of this list, or any command in WALKTHROUGH § A4.3), then search `request_id : "<your id>"` in Kibana. It shows the reading's 2–3 log lines within a few seconds.
+9. **Logs reach Kibana.** Send a reading with your own request ID (add `-H 'X-Request-ID: <your id>'` to the curl in [Send a reading](#send-a-reading)), then search `request_id : "<your id>"` in Kibana. It shows the reading's 2–3 log lines within a few seconds.
 10. **Logs outlive the container.** Run `docker compose up -d --force-recreate api`. `docker compose logs api | grep <your id>` now finds nothing, but the Kibana search still finds every line.
 11. **Prometheus scrapes all targets.** This lists `node up`, `prometheus up` and `sensor-api up`:
    ```bash
