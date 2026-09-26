@@ -1,0 +1,13 @@
+# Provisioned at Grafana startup; the datasource cannot be edited in the UI.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus          # dashboards reference the datasource by this uid
+    type: prometheus
+    access: proxy            # Grafana's backend queries Prometheus, not the browser
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s       # = Prometheus scrape_interval

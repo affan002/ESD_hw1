@@ -1,0 +1,89 @@
+services:
+  api:
+    build: .
+    image: sensor-api:dev
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/sensors.db
+      LOG_LEVEL: INFO
+      STALE_AFTER_S: "30"
+    volumes:
+      - sensor-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=2).status == 200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  simulator:
+    image: sensor-api:dev
+    command: ["python", "-m", "simulator.simulate"]
+    environment:
+      API_URL: http://api:8000
+      SIM_DEVICES: "20"
+      SIM_INTERVAL_S: "5"
+      SIM_SEED: "42"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ---------- Metrics (Part B) ----------
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    # Lets Prometheus reach node-exporter, which listens on the host's network.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - api
+
+  # Host metrics (CPU, memory, disk, network) for the machine running Docker.
+  # Host network and PID namespaces plus a read-only mount of / make it measure
+  # the host itself rather than its own container.
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    command:
+      - --path.rootfs=/host
+    network_mode: host
+    pid: host
+    volumes:
+      - /:/host:ro,rslave
+
+  # Dashboards and the Prometheus datasource are provisioned from files in
+  # monitoring/grafana, so the setup is reproducible with no manual clicking.
+  grafana:
+    image: grafana/grafana:13.2.2
+    ports:
+      - "3000:3000"
+    environment:
+      # Local use only: anyone who can reach port 3000 can view dashboards without
+      # logging in. Editing needs the admin login (admin/admin on first start).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/sensor-service.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  sensor-data:
+  prometheus-data:
+  grafana-data:

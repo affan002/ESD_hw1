@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sensor Fleet</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>Sensor Fleet</h1>
+      <span class="subtitle">IoT ingestion dashboard</span>
+    </div>
+    <div class="topbar-right">
+      <span id="health" class="health health-unknown" role="status">Checking API…</span>
+      <span id="updated" class="muted"></span>
+      <button id="toggle-refresh" type="button" class="btn btn-ghost" aria-pressed="false">Pause</button>
+    </div>
+  </header>
+
+  <div id="fault-banner" class="banner" hidden>
+    <span id="fault-banner-text"></span>
+    <button id="fault-banner-reset" type="button" class="btn btn-small">Turn off</button>
+  </div>
+
+  <main>
+    <section class="cards" aria-label="Fleet summary">
+      <div class="card"><span class="card-label">Devices</span><span id="count-all" class="card-value">–</span></div>
+      <div class="card card-ok"><span class="card-label">OK</span><span id="count-ok" class="card-value">–</span></div>
+      <div class="card card-anomaly"><span class="card-label">Anomaly</span><span id="count-anomaly" class="card-value">–</span></div>
+      <div class="card card-stale"><span class="card-label">Stale</span><span id="count-stale" class="card-value">–</span></div>
+      <div class="card"><span class="card-label">Readings stored</span><span id="count-readings" class="card-value">–</span></div>
+    </section>
+
+    <div class="layout">
+      <section class="panel panel-devices" aria-labelledby="devices-title">
+        <div class="panel-head">
+          <h2 id="devices-title">Devices</h2>
+          <div class="chips" role="group" aria-label="Filter by status">
+            <button type="button" class="chip active" data-filter="all">All</button>
+            <button type="button" class="chip" data-filter="ok">OK</button>
+            <button type="button" class="chip" data-filter="anomaly">Anomaly</button>
+            <button type="button" class="chip" data-filter="stale">Stale</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="devices">
+            <thead>
+              <tr>
+                <th scope="col">Device</th>
+                <th scope="col">Status</th>
+                <th scope="col" class="num">Temp °C</th>
+                <th scope="col" class="num">Humidity %</th>
+                <th scope="col">Battery</th>
+                <th scope="col">Last seen</th>
+                <th scope="col" class="num">Readings</th>
+                <th scope="col" class="num">Anomalies</th>
+              </tr>
+            </thead>
+            <tbody id="device-rows">
+              <tr><td colspan="8" class="empty">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="side">
+        <section class="panel" aria-labelledby="detail-title">
+          <div class="panel-head">
+            <h2 id="detail-title">Device detail</h2>
+            <button id="detail-close" type="button" class="btn btn-ghost btn-small" hidden>Close</button>
+          </div>
+          <div id="detail">
+            <p class="empty">Select a device to see its recent history.</p>
+          </div>
+        </section>
+
+        <section class="panel" aria-labelledby="anomalies-title">
+          <div class="panel-head"><h2 id="anomalies-title">Recent anomalies</h2></div>
+          <ol id="anomalies" class="feed">
+            <li class="empty">Loading…</li>
+          </ol>
+        </section>
+      </aside>
+    </div>
+
+    <div class="layout layout-tools">
+      <section class="panel" aria-labelledby="send-title">
+        <div class="panel-head"><h2 id="send-title">Send a test reading</h2></div>
+        <form id="send-form" class="form">
+          <div class="presets" role="group" aria-label="Presets">
+            <span class="muted">Presets:</span>
+            <button type="button" class="btn btn-small" data-preset="normal">Normal</button>
+            <button type="button" class="btn btn-small" data-preset="hot">Too hot</button>
+            <button type="button" class="btn btn-small" data-preset="battery">Low battery</button>
+            <button type="button" class="btn btn-small" data-preset="impossible">Impossible humidity</button>
+          </div>
+          <div class="fields">
+            <label>Device ID <input name="device_id" value="dev-100" required></label>
+            <label>Temperature °C <input name="temperature_c" type="number" step="any" value="22.5" required></label>
+            <label>Humidity % <input name="humidity_pct" type="number" step="any" value="45" required></label>
+            <label>Battery % <input name="battery_pct" type="number" step="any" value="88" required></label>
+          </div>
+          <p class="hint">The timestamp is set to now. Values are sent as typed, so the API does all the validation.</p>
+          <button type="submit" class="btn btn-primary">Send reading</button>
+          <div id="send-result" class="result" aria-live="polite"></div>
+        </form>
+      </section>
+
+      <section class="panel" aria-labelledby="faults-title">
+        <div class="panel-head"><h2 id="faults-title">Fault injection</h2><span class="tag">experiments</span></div>
+        <form id="fault-form" class="form">
+          <p class="hint">Affects <code>POST /readings</code> only. It's off by default, and a restart resets it.</p>
+          <div class="fields">
+            <label>Delay (ms) <input name="delay_ms" type="number" min="0" max="5000" value="0"></label>
+            <label>…on every Nth request <input name="delay_every_n" type="number" min="1" value="1"></label>
+            <label>Fail every Nth request (0 = off) <input name="error_every_n" type="number" min="0" value="0"></label>
+          </div>
+          <div class="row">
+            <button type="submit" class="btn btn-primary">Apply</button>
+            <button id="fault-reset" type="button" class="btn">Turn all off</button>
+          </div>
+          <div id="fault-result" class="result" aria-live="polite"></div>
+        </form>
+      </section>
+    </div>
+  </main>
+
+  <footer class="footer muted">
+    API docs: <a href="/docs">/docs</a> · Refreshes every 5 s
+  </footer>
+</body>
+</html>

@@ -1,0 +1,149 @@
+# CLAUDE.md
+
+Conventions for this repo. Keep them consistent, and update this file only when a new convention is actually decided.
+
+## Project
+- IoT sensor ingestion API, plus a device simulator. It's the base app for an observability assignment (Parts A–E).
+- **Parts A (API, dashboard and simulator) and B (Prometheus, Grafana, Node Exporter) are complete and verified.** Parts C–E (Filebeat/ES/Kibana, the experiments) have not started. Don't add ELK or the experiment code (such as a `request_id`-labelled counter) until asked.
+- Living docs, updated stage by stage after each stage's done check passes:
+  - `REPORT.md`: **concise**, answering exactly what each part of the assignment asks, in short paragraphs and tables. The style is `A. Project`, `B.1 …` numbered subsections, and conclusions with the key numbers only. Aim for about 50–100 lines per part. No stage-by-stage logs.
+  - `WALKTHROUGH.md`: a **learning guide for the author**, not a reference. Each part has concept, code pointers (`[file:line](file#Lline)`), exercises (predict, then run), how to read the dashboards, and check-yourself questions. When code moves, update its line links (check with `grep -n`). When a part is finished, add its section in the same style.
+  - Screenshots go in `docs/screenshots/`, named with a part prefix (`a_…`, `b_…`). Capture them with `scripts/capture_screenshots.sh`, which uses headless Chrome, a fixed absolute time window (never `now`, because virtual time makes graphs dip at the right edge) and the light theme. Every screenshot in the report needs an interpretation of what it actually shows, not just a caption.
+  - `docs/BUILD_LOG.md`: the stage-by-stage evidence (what was built, the exact command, the trimmed real output). Append a section per stage here; the report links to it.
+  - `README.md`: start/use/test/clean up. It must always match what runs right now.
+  - `CLAUDE.md`: this file.
+
+## Stack (pinned in requirements*.txt)
+- Python 3.12, FastAPI 0.141.1, uvicorn[standard] 0.54.0, pydantic 2.13.5, httpx 0.28.1, pytest 9.1.1.
+- Stdlib `sqlite3` (no ORM) and stdlib `logging`.
+- One uvicorn worker only. Don't add `--workers`: `prometheus_client` keeps metrics in process memory, so extra workers would each expose partial numbers.
+- Route handlers are sync `def`, so they run in the threadpool.
+
+## Layout
+- `app/`: the API.
+  - `main.py`: `create_app()` factory and routes.
+  - `config.py`: `load_settings()`, reads env vars.
+  - `__main__.py`: `python -m app`.
+  - `metrics.py`: every Prometheus metric, plus the device-status collector.
+  - `static/`: the operator dashboard.
+- `monitoring/`: Prometheus config (`prometheus/prometheus.yml`) and Grafana provisioning and dashboards (`grafana/`).
+- `simulator/`: the device fleet simulator (`python -m simulator.simulate`).
+- `tests/`: pytest. The `client` fixture in `conftest.py` builds the app against a temporary `DB_PATH`.
+
+## Run and test
+- Tests: `.venv/bin/pytest -q`
+- API locally: `.venv/bin/python -m app` (port 8000)
+- Docker: `docker compose up -d --build` (the full stack: api, simulator, prometheus, node-exporter, grafana) · API only: `docker compose up -d --build api` · stop: `docker compose down` · wipe all data, including metrics history: `docker compose down -v`
+
+## Docker and ports
+- Compose service `api` → image `sensor-api:dev`, port **8000**. Compose service `simulator` reuses the same image and has no ports.
+- Compose service `prometheus` (`prom/prometheus:v3.15.0`) on port **9090**, with volume `prometheus-data` and 7-day retention.
+  - Config: `monitoring/prometheus/prometheus.yml`, mounted read-only. It reloads with `curl -XPOST localhost:9090/-/reload` because `--web.enable-lifecycle` is on.
+  - Scrape interval **5 s**. Jobs: `sensor-api` → `api:8000` and `prometheus` → `localhost:9090`.
+  - Job `node` → `host.docker.internal:9100`. This needs `extra_hosts: host-gateway` on `prometheus`.
+  - All monitoring config lives under `monitoring/`.
+- Compose service `node-exporter` (`prom/node-exporter:v1.12.1`) uses `network_mode: host`, `pid: host` and `/:/host:ro,rslave` with `--path.rootfs=/host`. It listens on host port **9100**, and has no `ports:` entry because it's on the host network. Don't move it onto the Compose network, or it will measure a container instead of the host.
+- Never display `node_dmi_info`'s `chassis_asset_tag`, or MAC addresses, in dashboards or the report.
+- Compose service `grafana` (`grafana/grafana:13.2.2`) on port **3000**, with volume `grafana-data`. Anonymous Viewer access is on; admin login is admin/admin.
+  - **Everything is provisioned from files and nothing is clicked together in the UI.** The datasource is in `monitoring/grafana/provisioning/datasources/prometheus.yml` (uid **`prometheus`**; every panel references it by this uid). The dashboard provider is `provisioning/dashboards/dashboards.yml` (folder "Sensor Ingestion", `allowUiUpdates: false`).
+  - Dashboards are JSON in `monitoring/grafana/dashboards/`: `sensor-service.json` (uid `sensor-service`, also the home dashboard) and `node-host.json` (uid `node-host`). Edit the JSON; Grafana reloads it within 30 s.
+  - The empty `provisioning/alerting/` and `provisioning/plugins/` directories exist only to stop Grafana logging errors.
+  - PromQL conventions in panels: fixed `[1m]` rate windows, which is ≥ 4× the 5 s scrape; percentiles use `histogram_quantile(q, sum by (le) (rate(..._bucket[1m])))`; every panel has a `description`.
+- Named volume `sensor-data` is mounted at `/data`. The container runs as non-root user `app` (uid 10001).
+- The healthcheck uses a Python urllib call to `/health`, because the slim image has no curl.
+
+## Config (env vars)
+`DB_PATH` (default `./data/sensors.db`, `/data/sensors.db` in the container), `LOG_LEVEL` (INFO), `API_HOST` (0.0.0.0), `API_PORT` (8000), `STALE_AFTER_S` (30), `FUTURE_SKEW_S` (60).
+
+## Routes (current)
+- `GET /` (dashboard), `/static/*`
+- `GET /health`
+- `POST /readings`
+- `GET /devices[?status=]`
+- `GET /devices/{device_id}`
+- `GET /devices/{device_id}/readings[?limit=&anomalies_only=]`
+- `GET /anomalies[?limit=]`
+- `GET|PUT|DELETE /admin/faults`: the fault-injection contract is `FaultConfig {delay_ms 0..5000, delay_every_n ≥1, error_every_n ≥0 (0=off)}`.
+  - `PUT` replaces the whole config and resets the request counter. `DELETE` turns everything off.
+  - Faults apply only to `POST /readings`, via `faults.apply()` at the top of the handler, after body validation.
+  - The state is in memory (`app.state.faults`), so a restart resets it. It's deterministic (every Nth request), never random.
+  - Log events: `fault_config_changed` (WARNING) and `fault_injected` (`fault=delay` at WARNING with `delay_ms`, or `fault=error` at ERROR).
+- Lists wrap their items in an object (`{"count","devices"}`, `{"device_id","readings"}`, `{"readings"}`), never a bare array. `limit` is always 1–500 with a default of 50 (the `Limit` alias in `main.py`). Unknown devices return `404 {"detail":"device not found"}`.
+
+## API conventions
+- Routes use plural nouns and no verbs: `/readings`, `/devices`, `/anomalies`. Operator controls go under `/admin/*`.
+- JSON field names are snake_case with units as suffixes: `temperature_c`, `humidity_pct`, `battery_pct`.
+- `device_id` must match `^dev-\d{3}$` (`DEVICE_ID_PATTERN` in `app/models.py`).
+- Validation errors use FastAPI's default `422 {"detail":[...]}`. Custom validation failures raise `RequestValidationError` with a custom `type` (e.g. `timestamp_in_future`), so they go through the same handler and log line.
+- The validation handler logs `reading_rejected` for `POST /readings` and `request_invalid` for everything else, with `errors=[{field,type}]` only.
+- Ingestion log events: `device_registered`, `reading_stored` (INFO) and `anomaly_detected` (WARNING, includes values).
+
+## Data model (SQLite, `app/db.py`)
+- All SQL lives in `app/db.py`. Routes call its functions and never write SQL themselves.
+- Connections: `db.connect(path)` (autocommit, `busy_timeout=5000`, `row_factory=Row`). WAL is set once in `init_schema()`, which runs in the lifespan.
+- Each request gets a connection through the `get_conn` dependency in `main.py`.
+- Writes use an explicit `BEGIN IMMEDIATE` … `COMMIT`/`ROLLBACK`.
+- `readings`: `id, device_id, recorded_at, received_at, temperature_c, humidity_pct, battery_pct, is_anomaly (0/1), anomaly_reasons (JSON array text)`
+- `devices`: `device_id (PK), first_seen, last_seen, reading_count, anomaly_count, last_reading_id`
+- `last_seen` and `first_seen` use server time (`received_at`), never the device clock.
+- API field names differ from the database in one place: the API's `timestamp` is `readings.recorded_at`.
+- Models are in `app/models.py`. Physical limits (a 422 when exceeded) are in `ReadingIn`; the expected range (an anomaly) is in `app/anomaly.py`.
+
+## Anomaly rule (`app/anomaly.py`)
+- Thresholds live **only** in `app/anomaly.py` as constants. Bounds are inclusive: a value on a bound is normal.
+  - Temperature: 10–35 °C
+  - Humidity: 20–80 %RH
+  - Battery: ≥ 15 %
+- Reason codes, always emitted in this order: `temperature_low | temperature_high`, `humidity_low | humidity_high`, `battery_low`. `is_anomaly = bool(reasons)`.
+- Device status values are exactly `ok | anomaly | stale`, computed at query time by `compute_status()`, in the order stale > anomaly > ok.
+
+## Simulator (`simulator/simulate.py`)
+- Device IDs are `dev-001`…`dev-NNN`, from `f"dev-{index+1:03d}"`.
+- The defaults are 20 devices, a 5 s interval per device and seed 42. That's round-robin with a tick every `interval/devices` seconds, about 4 requests/second.
+- **The faulty devices are always the last 4**, in this order: `overheat, low_battery, invalid, dropout`. With the defaults they're dev-017…020. Every other device is `normal`.
+- The profile constants (`OVERHEAT_STEP_C`, `LOW_BATTERY_*`, `INVALID_PROBABILITY`, `DROPOUT_PERIOD_S`) live at the top of `simulate.py`. Tests in `tests/test_simulator.py` check the anomaly timing, so update them together.
+- Each device has its own `random.Random(seed + index)`, so runs are deterministic. Don't use the global `random` module.
+- Each send uses `X-Request-ID: sim-<12 hex>`, set in `request_id_var` so the simulator's log line carries the same ID as the API's.
+- Log events: `sim_startup`, `sim_send_failed` (WARNING, with `status_code` and, for dev-019, `fault=<invalid kind>`), `sim_summary` (with `stats`, every 30 s and on exit), and `sim_api_unavailable`.
+- Compose service `simulator` reuses image `sensor-api:dev` and waits for `api` to be healthy. It exits cleanly on SIGTERM/SIGINT and logs a final summary.
+
+## Dashboard (`app/static/`)
+- Plain HTML, CSS and JavaScript: `index.html`, `styles.css`, `app.js`. No framework, bundler, npm or CDN. `GET /` serves `index.html` (excluded from OpenAPI), and `/static` is a `StaticFiles` mount.
+- The dashboard calls **only the public JSON API**. Don't add UI-specific endpoints.
+- **Never duplicate anomaly thresholds in JavaScript.** Highlight values using the API's `anomaly_reasons`.
+- Build the DOM with the `el()` helper and `textContent`. Never use `innerHTML` or `insertAdjacentHTML`; `tests/test_ui.py` checks this.
+- UI requests send `X-Request-ID: ui-<12 hex>`. The request ID prefixes are `sim-` for the simulator, `ui-` for the dashboard, and a bare UUID for anything else.
+- Colours are CSS variables on `:root`, redefined under `prefers-color-scheme: dark`. The layout stacks below 1180 px, and the page must not scroll horizontally at 375 px; only `.table-wrap` may scroll.
+- The page refreshes every 5 s (`REFRESH_MS`). Detail charts show the last 50 readings (`HISTORY_LIMIT`).
+
+## Metrics (`app/metrics.py`, Part B)
+- The library is `prometheus_client`, using its **default registry** (which also provides `process_*` and `python_info`). Every metric object is defined in `app/metrics.py`; other modules import it and call `.inc()`, `.observe()` or `.set()`.
+- `GET /metrics` serves the text format. It's excluded from the OpenAPI docs.
+- **Naming:** `sensor_` prefix, snake_case, base units with a suffix (`_seconds`, `_total` for counters). Never use milliseconds in metrics.
+- **Labels only take values from small fixed sets:** `method`, `route` (the same template the access log uses: `/devices/{device_id}`, `/static`, `unmatched`), `status_code`. **Never** use `device_id`, `request_id` or raw paths as labels; they belong in logs.
+- HTTP metrics are recorded in `RequestContextMiddleware`, not in handlers.
+- Latency histogram buckets are dense from 10 to 40 ms, where normal `POST /readings` latency sits. `histogram_quantile` interpolates inside a bucket, and coarse buckets overestimated p99 by 74 % (docs/BUILD_LOG.md, stage B7). If you change the buckets, re-run the logs-vs-histogram check, and keep bounds at 25 ms and 100 ms because the Apdex panel uses them (T and 4T).
+- Business metrics are recorded where the event happens:
+  - `sensor_readings_total{outcome=normal|anomaly|rejected|failed}` (handler and validation handler)
+  - `sensor_reading_validation_errors_total{field,reason}`, where `field` goes through `metrics.validation_field()` so it's always one of the 5 fields or `body`
+  - `sensor_anomalies_total{reason}`
+  - `sensor_db_write_duration_seconds` (the Summary, wrapping `db.insert_reading`)
+  - `sensor_faults_injected_total{fault}` and `sensor_fault_active{fault}` (in `app/faults.py`)
+- `sensor_devices{status}` comes from `DeviceStatusCollector`, which runs at scrape time using the same `compute_status()` as the API. `create_app()` calls `metrics.DEVICE_STATUS.configure(settings)`. Never keep a separate running device count.
+- Create every known label combination at startup (see the loop in `metrics.py`), so series exist at 0.
+- The image sets `PROMETHEUS_DISABLE_CREATED_SERIES=True`, so there are no `*_created` series.
+- Tests: metrics accumulate in the process-wide registry, so assert on deltas (`after - before`) with `REGISTRY.get_sample_value`, never on absolute values.
+
+## Code rules
+- All output goes through `logging`. Never use `print()`.
+- Timestamps always use `app/timeutil.py`: `utc_iso()` produces ISO-8601 UTC with ms precision and a `Z` suffix, e.g. `2026-09-26T10:00:00.000Z`.
+
+## Logging conventions
+- Call `setup_logging(service)` once, at the entry point only (`app/__main__.py`, and the simulator). Never call it in `create_app()`, because tests rely on pytest's `caplog`.
+- One JSON object per line on stdout. Every line has these base fields: `timestamp, level, service, logger, event, message, request_id`.
+- Log with `log.<level>("human message", extra={"event": "<snake_case>", ...})`. Every app log line needs an `event`; uvicorn's lines get `event: "log"`.
+- Extra fields are only emitted if they're listed in `EXTRA_FIELDS` in `app/logging_setup.py`. To log a new field, add it there. Never log request bodies, client IPs or secrets.
+- `service` is `sensor-api` for the API and `simulator` for the simulator.
+- `X-Request-ID`: accepted when it matches `^[A-Za-z0-9._-]{1,64}$`, otherwise replaced with `uuid4().hex`. It's echoed on every response and stored in `request_id_var`.
+- `http_request.path` is the route template (e.g. `/devices/{device_id}`), the mount prefix for mounted apps (`/static`), or `unmatched` when nothing matched. Never use the raw URL, so the set of values stays bounded.
+- Crashes are caught in `RequestContextMiddleware`, which returns a JSON 500 and logs `event=unhandled_exception` with a `stack` field.
