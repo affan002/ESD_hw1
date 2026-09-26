@@ -1,0 +1,1 @@
+{"stage": "fault", "start_utc": "2026-09-26T20:36:50.857Z", "end_utc": "2026-09-26T20:39:20.657Z", "rate_per_s": 5.0, "sent": 750, "status_counts": {"201": 750}, "client_latency_ms": {"p50": 13.0, "p95": 513.9, "p99": 514.7, "max": 528.5, "mean": 112.1}}

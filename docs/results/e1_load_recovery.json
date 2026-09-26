@@ -1,0 +1,1 @@
+{"stage": "recovery", "start_utc": "2026-09-26T20:41:18.961Z", "end_utc": "2026-09-26T20:43:48.761Z", "rate_per_s": 5.0, "sent": 750, "status_counts": {"201": 750}, "client_latency_ms": {"p50": 12.7, "p95": 13.9, "p99": 17.6, "max": 34.5, "mean": 11.8}}

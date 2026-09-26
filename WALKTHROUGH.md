@@ -42,7 +42,24 @@ Everything below was run against the live stack on 2026-09-26. Your numbers will
   - [C7. Experiments](#c7-experiments-to-run-yourself)
   - [C8. From what you see to the report](#c8-from-what-you-see-to-the-report)
   - [C9. Check yourself](#c9-check-yourself)
-- [Glossary](#glossary) · [What Parts D–E will teach](#what-parts-de-will-teach)
+- **Part D: system design**
+  - [D1. Concepts](#d1-the-concepts-you-need)
+  - [D2. The architecture](#d2-the-architecture-from-the-configuration)
+  - [D3. Failure modes](#d3-failure-modes-predict-then-break-it)
+  - [D4. Follow a metric](#d4-follow-a-metric-yourself)
+  - [D5. Follow a log](#d5-follow-a-log-yourself)
+  - [D6. From what you see to the report](#d6-from-what-you-see-to-the-report)
+  - [D7. Check yourself](#d7-check-yourself)
+- **Part E: experiments**
+  - [E1. Concepts](#e1-the-concepts-you-need)
+  - [E2. Code pointers](#e2-code-pointers)
+  - [E3. Run E1 yourself](#e3-run-e1-yourself)
+  - [E4. The wrong predictions](#e4-what-the-two-wrong-predictions-teach)
+  - [E5. The timeout-and-retry trap](#e5-the-timeout-and-retry-trap-effect-on-users)
+  - [E6. Run E2 yourself](#e6-run-e2-yourself)
+  - [E7. From what you see to the report](#e7-from-what-you-see-to-the-report)
+  - [E8. Check yourself](#e8-check-yourself)
+- [Glossary](#glossary)
 
 ---
 
@@ -93,7 +110,9 @@ Keep one question in mind throughout: **"How would I know?"** How would I know t
 | `simulator` | none (it only sends traffic) | Watch it with `docker compose logs -f simulator --no-log-prefix` |
 | `prometheus` | http://localhost:9090 | Query metrics and check the scrape targets |
 | `grafana` | http://localhost:3000 (no login needed to view) | The dashboards |
-| `node-exporter` | http://localhost:9100/metrics | Raw host metrics |
+| `node-exporter` | http://172.17.0.1:9100/metrics (Docker's bridge address, not `localhost`) | Raw host metrics |
+
+Every URL here works **only from this laptop**. All ports are bound to 127.0.0.1, because nothing has a login. Try `curl http://192.168.x.x:8000/health` with your Wi-Fi address (from `ip -br addr`): the connection is refused. See [A5](#a5-design-decisions-worth-understanding).
 
 > **Run every `docker compose …` command from the project folder** (`cd ~/Documents/ESD/ESD_hw1`). Compose finds the stack through `docker-compose.yml` in the current folder. From anywhere else it fails with `no configuration file provided: not found`. `curl` commands work from any folder. To read a container's logs from elsewhere, use its full name, e.g. `docker logs esd_hw1-api-1`.
 
@@ -344,6 +363,7 @@ Each device has its own seeded random generator, so a run can be repeated. That'
 | Route *template* in logs and metrics | `/devices/{device_id}` is 1 value; `/devices/dev-001…dev-999` is 999 | Metrics get expensive (Part E's cardinality lesson) |
 | Faults are deterministic (every Nth request) | Experiments must be repeatable | Random faults give different numbers every run |
 | One uvicorn worker | `prometheus_client` keeps metrics in process memory | With 4 workers, each scrape would see only one worker's numbers |
+| Every port bound to 127.0.0.1 | Nothing has authentication: `/admin/faults`, Grafana, Elasticsearch | On shared Wi-Fi, anyone could read your logs, or switch on fault injection with one `curl` |
 
 ## A6. Check yourself
 
@@ -838,7 +858,8 @@ Open **http://localhost:5601/app/discover**. There's no login, and it opens on t
 2. **Why does dev-019 fail?** Search `event : "reading_rejected"` and add the columns `errors.field` and `errors.type`. How many different reasons are there? *(3, rotating: humidity 150, a missing temperature, a future timestamp. See [simulate.py:27](simulator/simulate.py#L27).)*
 3. **Same failure, two viewpoints.** Take one rejected row's `request_id` (`sim-…`) and search for it. You'll get the API's `reading_rejected` + `http_request` **and** the simulator's `sim_send_failed`. One ID, two services.
 4. **Severity over time.** Search `level : "WARNING"`, then click the `event` field on the left. Which event produces most warnings? *(`anomaly_detected`, mostly dev-018.)*
-5. **Metrics versus logs, the same events.** Set Kibana to *Last 15 minutes* and note the number of `event : "reading_rejected"` documents. Then, in Prometheus (http://localhost:9090/query), run `sum(increase(sensor_readings_total{outcome="rejected"}[15m]))`. The two should roughly agree: the same rejections, counted once as a metric (a number) and once as logs (one document each). They won't match exactly, because `increase()` extrapolates to the edges of the window and the two windows don't start at exactly the same instant.
+5. **Find errors.** `level : "ERROR"` normally returns nothing. Switch on the error fault for 30 s (`curl -s -XPUT localhost:8000/admin/faults -H 'content-type: application/json' -d '{"delay_ms":0,"delay_every_n":1,"error_every_n":10}'`, then `curl -s -XDELETE localhost:8000/admin/faults`). **Predict** how many ERROR documents appear per injected failure. Then search, and follow one failed request's `request_id` across both services. *(2 per failure: `fault_injected` + `http_request … 500`. The simulator's `sim_send_failed` for the same ID is only a WARNING: from the client's side, a failed send is a problem, not a crash.)*
+6. **Metrics versus logs, the same events.** Set Kibana to *Last 15 minutes* and note the number of `event : "reading_rejected"` documents. Then, in Prometheus (http://localhost:9090/query), run `sum(increase(sensor_readings_total{outcome="rejected"}[15m]))`. The two should roughly agree: the same rejections, counted once as a metric (a number) and once as logs (one document each). They won't match exactly, because `increase()` extrapolates to the edges of the window and the two windows don't start at exactly the same instant.
 
 The report's screenshots of these views, with what each shows, are in [REPORT.md § C.4–C.5](REPORT.md#c4-searching-in-kibana).
 
@@ -913,6 +934,435 @@ No. It's a trade-off between cost, privacy and how far back you can investigate.
 
 ---
 
+# Part D — system design
+
+## D1. The concepts you need
+
+Parts A–C built pieces. Part D asks whether you can **explain the whole system**: what talks to what, where each kind of data lives, and what breaks when a piece stops. On-call engineers are judged on this mental model, not on knowing every config line.
+
+Four ideas carry most of it:
+
+| Idea | Meaning | Where you've seen it |
+|---|---|---|
+| **Pull vs push** | Prometheus *pulls* metrics on a schedule; Filebeat *pushes* logs from a durable file. A failed pull is a missing sample, **gone forever**. A failed push is **retried later** | [B5](#b5-experiments-to-run-yourself) experiment 5, [C7](#c7-experiments-to-run-yourself) experiment 3 |
+| **Blast radius** | What else a failure takes down. Here, the monitoring can fail without the app noticing, because the app doesn't know it exists | The failure table in [REPORT.md § D.2](REPORT.md#d2-what-happens-if-a-component-stops-tested) |
+| **Buffer vs store** | A buffer holds data briefly so the next stage can catch up (Docker's log file, about 2.5 h). A store is where data is kept and queried (SQLite, Prometheus, Elasticsearch) | [C3](#c3-layer-2-dockers-log-file-the-buffer) |
+| **Follow the data** | Tracing one value, or one line, through every hop is how you find *where* something went wrong | [A3](#a3-follow-one-reading-through-the-code), [C2–C6](#c2-layer-1-what-the-app-writes-stdout) |
+
+## D2. The architecture, from the configuration
+
+The diagram is **text**: [docs/diagrams/architecture.mmd](docs/diagrams/architecture.mmd) (Mermaid). It's rendered to `architecture.png`/`.svg` by [scripts/render_diagram.sh](scripts/render_diagram.sh). Every arrow comes from a line of configuration:
+
+| Arrow in the diagram | The line that creates it |
+|---|---|
+| simulator → api `POST /readings` | `API_URL: http://api:8000` in [docker-compose.yml](docker-compose.yml) (`simulator`) |
+| Prometheus → `api:8000/metrics` every 5 s | [monitoring/prometheus/prometheus.yml](monitoring/prometheus/prometheus.yml) (`scrape_interval`, job `sensor-api`) |
+| Prometheus → `host.docker.internal:9100` | the same file (job `node`), plus `extra_hosts` at [docker-compose.yml:59](docker-compose.yml#L59) and `--web.listen-address=172.17.0.1:9100` |
+| Grafana → Prometheus | [monitoring/grafana/provisioning/datasources/prometheus.yml](monitoring/grafana/provisioning/datasources/prometheus.yml) (`url`, `uid`) |
+| api stdout → Docker's file | the `x-app-logging` anchor at the top of [docker-compose.yml](docker-compose.yml) |
+| Docker's file → Filebeat (`tail + decode_json_fields`) | the `filebeat` volumes in docker-compose.yml (the log directory and `docker.sock`, both read-only), and [monitoring/filebeat/filebeat.yml:13](monitoring/filebeat/filebeat.yml#L13) |
+| Filebeat → Elasticsearch | [filebeat.yml:73](monitoring/filebeat/filebeat.yml#L73) (`output.elasticsearch`) |
+| logs-setup → Elasticsearch and Kibana | [monitoring/logs-setup.sh](monitoring/logs-setup.sh). (Not drawn: Filebeat waits for it to finish, `condition: service_completed_successfully` at [docker-compose.yml:172](docker-compose.yml#L172).) |
+
+**Startup order** is also architecture. The `depends_on` conditions encode it:
+1. The simulator waits for the API to be healthy ([line 41](docker-compose.yml#L41)).
+2. Kibana and `logs-setup` wait for Elasticsearch to be healthy.
+3. Filebeat waits for `logs-setup` to have **finished** ([line 172](docker-compose.yml#L172)).
+
+**Try it:**
+1. Close the diagram, and draw the system yourself from `docker-compose.yml` alone.
+2. Compare it with the PNG. Anything you missed is something you didn't yet understand.
+3. Then change something small in the `.mmd` file (e.g. a label), and run `scripts/render_diagram.sh` to see how the diagram stays in sync with the code.
+
+## D3. Failure modes: predict, then break it
+
+**For each service, write down three things *before* running anything:**
+1. Can users still send readings?
+2. What do the dashboards show?
+3. Is any data lost?
+
+Then run the following for each one, and check your predictions. **Stop one at a time; never stop the API during an experiment you care about.**
+
+Stop the service (replace `prometheus` with the service you're testing):
+
+```bash
+docker compose stop prometheus
+```
+
+While it's down, send a tagged reading (change `d-me-1` for each test):
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -XPOST localhost:8000/readings -H 'content-type: application/json' -H 'X-Request-ID: d-me-1' -d "{\"device_id\":\"dev-100\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"temperature_c\":22,\"humidity_pct\":45,\"battery_pct\":88}"
+```
+
+Look around while it's down: the Grafana dashboard, http://localhost:9090/targets, and Kibana. Then start it again:
+
+```bash
+docker compose start prometheus
+```
+
+Afterwards, check: did the tagged reading's logs arrive (Kibana `request_id : "d-me-1"`)? Is there a gap in Grafana?
+
+<details><summary>What the tests showed (REPORT.md D.2)</summary>
+
+- **api:** the only one users feel. The simulator loses about 4 readings per second of downtime, because it doesn't retry. Prometheus records `up=0`.
+- **prometheus:** the app is fine; Grafana errors; the gap in the graphs is **permanent**.
+- **grafana:** nothing is lost; it's only a viewer.
+- **node-exporter:** Prometheus records `up=0` for the `node` job; the host panels are empty.
+- **elasticsearch:** Filebeat retries and **nothing is lost**; Kibana is unavailable meanwhile.
+- **kibana:** ingestion continues.
+- **filebeat:** it catches up from its registry, with no duplicates.
+- **simulator:** all devices go `stale` after 30 s.
+</details>
+
+**The key comparison: why does stopping Prometheus lose data, but stopping Elasticsearch doesn't?** *(Nothing keeps the metric values that were never scraped: `/metrics` shows only the current value. Log lines sit in Docker's file until Filebeat's registry confirms they were delivered.)*
+
+## D4. Follow a metric yourself
+
+Pick a series that's currently 0 and that no simulated device produces. `sensor_anomalies_total{reason="humidity_high"}` works. Watch it at each hop.
+
+At the app, before the change:
+
+```bash
+curl -s localhost:8000/metrics | grep 'reason="humidity_high"'
+```
+
+Send one reading with humidity 90 %:
+
+```bash
+curl -s -XPOST localhost:8000/readings -H 'content-type: application/json' -H 'X-Request-ID: d-me-metric' -d "{\"device_id\":\"dev-100\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"temperature_c\":22,\"humidity_pct\":90,\"battery_pct\":88}"
+```
+
+At the app again: it went up by 1 straight away.
+
+```bash
+curl -s localhost:8000/metrics | grep 'reason="humidity_high"'
+```
+
+In Prometheus, look at the raw samples. When did the 1 appear?
+
+```bash
+curl -s --get localhost:9090/api/v1/query --data-urlencode 'query=sensor_anomalies_total{reason="humidity_high"}[30s]' | jq -r '.data.result[0].values[] | "\(.[0]|todate) \(.[1])"'
+```
+
+**Predict:**
+1. How many seconds after your `curl` does Prometheus first store the 1? *(0–5 s, depending on where the scrape cycle is; we saw 2.2 s.)*
+2. What will the Grafana panel *Anomalies per minute by reason* show for `humidity_high`, and for how long? *(About 1 for exactly one minute, then 0: the `increase(...[1m])` window sliding past the event.)*
+3. Why about 1.05 and not exactly 1? *(`increase()` extrapolates to the edges of the window.)*
+
+**The code path:** `evaluate()` ([app/anomaly.py:25](app/anomaly.py#L25)) → `metrics.ANOMALIES.labels(reason).inc()` ([app/main.py:158](app/main.py#L158)) → `render()` serves it on `/metrics` ([app/metrics.py:161](app/metrics.py#L161)) → the scrape → the TSDB → the panel query in [sensor-service.json](monitoring/grafana/dashboards/sensor-service.json) (*Anomalies per minute by reason*).
+
+## D5. Follow a log yourself
+
+Use the same reading (`d-me-metric`), and follow its `anomaly_detected` line.
+
+1. The app writes it (`anomaly_detected`, [app/main.py:176](app/main.py#L176)):
+   ```bash
+   docker compose logs api --no-log-prefix | grep '"d-me-metric"'
+   ```
+2. Docker saves it. Get the full container ID first:
+   ```bash
+   CID=$(docker compose ps -q api | xargs docker inspect -f '{{.Id}}')
+   ```
+   Then print the line from Docker's log file. Note how our JSON is now *inside* a string:
+   ```bash
+   docker compose exec -T filebeat grep '"d-me-metric' /var/lib/docker/containers/$CID/$CID-json.log
+   ```
+3. Filebeat collects it. Which input read it? Look for `container-<CID>`:
+   ```bash
+   docker compose logs filebeat --no-log-prefix | grep "container-$CID" | head -1 | jq -c '{t: ."@timestamp", message}'
+   ```
+4. Elasticsearch stores it. Which backing index is it in? Which fields got which type?
+   ```bash
+   curl -s localhost:9200/sensor-logs/_search -H 'Content-Type: application/json' -d '{"query":{"term":{"request_id":"d-me-metric"}}}' | jq '.hits.hits[] | {_index, event: ._source.event}'
+   ```
+5. Kibana finds it: `request_id : "d-me-metric"`.
+
+**Predict:** is the log searchable before or after the metric shows up in Prometheus? *(After: we measured 6.6 s for the log, against 2.2 s for the metric. Filebeat batches lines, and Elasticsearch makes new documents searchable about once a second.)*
+
+**Fill in this table yourself.** The report's version is in [REPORT.md § D.4](REPORT.md#d4-follow-a-log-the-same-readings-anomaly_detected-line).
+
+| Hop | What the line looks like | Which config or code decides that |
+|---|---|---|
+| app stdout | | |
+| Docker's file | | |
+| after Filebeat's processors | | |
+| stored in Elasticsearch | | |
+
+## D6. From what you see to the report
+
+| Report section | How to verify it | How to change it |
+|---|---|---|
+| D.1 diagram | Compare each arrow with the table in [D2](#d2-the-architecture-from-the-configuration) | Edit `docs/diagrams/architecture.mmd`, then run `scripts/render_diagram.sh` |
+| D.1 storage table | The `volumes:` in docker-compose.yml; `ilm-policy.json`; `--storage.tsdb.retention.time` | — |
+| D.2 failure table | The experiments in [D3](#d3-failure-modes-predict-then-break-it); raw results in docs/BUILD_LOG.md (D1) | If you change a component, re-test its row |
+| D.3 and D.4 follow a metric / a log | [D4](#d4-follow-a-metric-yourself) and [D5](#d5-follow-a-log-yourself) with your own request ID | The report's request (`d2-follow-1`) is deleted by retention after about 1 h, so the screenshots and quotes are its record |
+| D.5 open questions | Try to answer one! E.g. read Elasticsearch's docs on data stream generations or the failure store | Remove it once you've *verified* the answer, and say how |
+
+## D7. Check yourself
+
+<details><summary>1. The API is healthy but every Grafana panel says "No data". Where do you look first?</summary>
+
+First Prometheus: http://localhost:9090/targets, and is it running at all? Then Grafana's datasource. The app is fine; the metrics *path* is broken.
+</details>
+
+<details><summary>2. Why doesn't a Prometheus outage appear as <code>up=0</code> anywhere?</summary>
+
+`up` is written *by* Prometheus after each scrape. If Prometheus isn't running, nothing writes anything. That's why real setups monitor Prometheus from a second Prometheus, or run an external check.
+</details>
+
+<details><summary>3. Elasticsearch is down for 3 hours. Are logs lost? How many?</summary>
+
+Probably yes, for the oldest part. Docker keeps about 30 MB ≈ 2.5 h of API logs, and after that rotation deletes the oldest file, which may not have been shipped yet. (That this is exactly how Filebeat behaves on rotation is still an open question, D.5 #3.)
+</details>
+
+<details><summary>4. Which single change would remove the only user-visible data loss in D.2?</summary>
+
+Make the client (the simulator, or the real device firmware) retry failed sends with backoff, ideally with an idempotency key such as a reading ID, so a retry can't store the same reading twice.
+</details>
+
+<details><summary>5. Why keep the diagram as Mermaid text instead of a drawing?</summary>
+
+It's versioned with the configuration it describes, it can be reviewed in a diff, and it's regenerated with a script. It's the same reasoning as the provisioned Grafana dashboards and Kibana saved objects.
+</details>
+
+---
+
+# Part E — experiments
+
+## E1. The concepts you need
+
+Part E is **the scientific method, applied to a running system**. The point isn't to break things. It's to find out whether you *understand* the system well enough to predict what breaking it will do.
+
+| Step | Why it matters |
+|---|---|
+| **A repeatable test** | If the load changes between runs, you can't tell what caused a difference. So E1 uses a fixed-rate script, not the simulator's varied traffic |
+| **A baseline** | "p95 is 875 ms" means nothing unless you know it was 15 ms before |
+| **A written prediction** | Written *before*, with numbers. A wrong prediction is the most valuable result, because it shows where your model of the system is wrong |
+| **Introduce one change** | Exactly one variable changes: the fault config |
+| **Explain the effect on users** | Metrics describe the system; users experience requests. Connect the two |
+| **Recover and repeat** | This proves the change caused the effect, and that it can be undone |
+
+**Open vs closed loop** is the one new idea in the load script:
+- **Closed loop:** send, wait for the reply, send the next. If the server slows down, the client sends less, which *hides* the problem. The simulator works this way.
+- **Open loop:** start a request every 0.2 s regardless of replies. The load stays constant, so latency changes are purely the server's doing. `scripts/load.py` works this way.
+
+**Cardinality** (E2): every distinct combination of label values is a separate time series, stored and indexed for as long as retention keeps it. The cost grows with the number of *distinct values*, not with traffic.
+
+## E2. Code pointers
+
+| Piece | Where |
+|---|---|
+| The fault itself: count requests, sleep on every Nth | [app/faults.py:49](app/faults.py#L49), with the `n % delay_every_n` check at [line 54](app/faults.py#L54) and the sleep at [line 61](app/faults.py#L61) |
+| Where it runs in the request | the first line of `create_reading`, [app/main.py:121](app/main.py#L121). That's **before** the database write, which is why DB time didn't change |
+| The fault counter and gauge | [app/faults.py:60](app/faults.py#L60) (`FAULTS_INJECTED`) and `_publish()` (`FAULT_ACTIVE`) |
+| The fixed-rate load | [scripts/load.py](scripts/load.py): the loop that starts a request every `1/rate` s |
+| Per-stage server numbers | [scripts/e1_stage_stats.py](scripts/e1_stage_stats.py): `increase(...[window])` evaluated at the stage end |
+| The demo's own registry and the 100 cap | [scripts/cardinality_demo.py:22](scripts/cardinality_demo.py#L22) (`MAX_IDS`) and [line 30](scripts/cardinality_demo.py#L30) (`CollectorRegistry()`) |
+| How Prometheus finds the demo | the `cardinality-demo` job in [monitoring/prometheus/prometheus.yml](monitoring/prometheus/prometheus.yml), reading `file_sd/cardinality-demo.json` |
+| The whole E2 sequence, including cleanup | [scripts/cardinality_demo.sh](scripts/cardinality_demo.sh) |
+
+## E3. Run E1 yourself
+
+Stop the simulator, so only your load hits `POST /readings`:
+
+```bash
+docker compose stop simulator
+```
+
+Wait about 70 s, so its traffic leaves the 1-minute window. Then run the baseline:
+
+```bash
+python3 scripts/load.py --stage my-baseline --rate 5 --duration 150 --out /tmp/b.json
+```
+
+Compute the server-side numbers for exactly that window:
+
+```bash
+python3 scripts/e1_stage_stats.py my-baseline $(jq -r .start_utc /tmp/b.json) $(jq -r .end_utc /tmp/b.json) | jq
+```
+
+**Now write your predictions down,** before going further. Try a *different* fault from the report's, e.g. `delay_ms: 300, delay_every_n: 10`:
+- What will p50, p95, p99 and the mean be? And what will `histogram_quantile` report for p95 and p99?
+
+  Hint: the delayed requests take about 312 ms, which lands in the 0.25–0.5 s bucket. The share of requests at or below 0.25 s is 0.90, so p95 = 0.25 + (0.95 − 0.90)/0.10 × 0.25 = **?**
+- Which request IDs will be delayed?
+- What will Apdex be?
+
+Then switch the fault on:
+
+```bash
+curl -s -XPUT localhost:8000/admin/faults -H 'content-type: application/json' -d '{"delay_ms":300,"delay_every_n":10,"error_every_n":0}'
+```
+
+Run the same load for the fault stage:
+
+```bash
+python3 scripts/load.py --stage my-fault --rate 5 --duration 150 --out /tmp/f.json
+```
+
+Compute that stage's numbers:
+
+```bash
+python3 scripts/e1_stage_stats.py my-fault $(jq -r .start_utc /tmp/f.json) $(jq -r .end_utc /tmp/f.json) | jq
+```
+
+Switch the fault off. **Always do this**, or it stays on until the API restarts:
+
+```bash
+curl -s -XDELETE localhost:8000/admin/faults
+```
+
+Start the simulator again:
+
+```bash
+docker compose start simulator
+```
+
+<details><summary>Answers for 300 ms every 10th</summary>
+
+- p50 is unchanged, about 12 ms.
+- `histogram_quantile` p95 = 0.25 + 0.5 × 0.25 = **0.375 s**, and p99 = 0.25 + 0.9 × 0.25 = **0.475 s**. The true p95 is about 312 ms.
+- The mean is about 0.9 × 12 + 0.1 × 312 ≈ **42 ms**.
+- Apdex = 0.90.
+- The delayed IDs end in **9**: `-00009`, `-00019`, …
+</details>
+
+**Read the result in Grafana** at http://localhost:3000/d/sensor-service, time range *Last 15 minutes*:
+- **Latency percentiles:** p95 and p99 step up, while p50 stays flat.
+- **Apdex:** it drops by exactly the share of delayed requests.
+- **Faults injected per minute:** it plateaus at rate × 60 / N.
+
+**And in Kibana:** `event : "http_request" and duration_ms > 250` shows only the fault stage, one row per delayed request, each with its ID.
+
+## E4. What the two wrong predictions teach
+
+Neither was a mistake in arithmetic; each was a gap in understanding. That's exactly what a prediction is for.
+
+1. **"Requests in flight" (a gauge) almost never showed the delayed requests.**
+   - Prometheus samples a gauge only at the moment of each scrape (always .449 s past the second here).
+   - The delayed requests were in flight at the same fraction of every second (.657 to .157), so a sample never landed on one.
+   - **The lesson:** gauges show *snapshots*. For anything shorter than the scrape interval, use a counter or histogram, which *accumulate* between scrapes.
+2. **Recovery looked instant (10 s) instead of taking about 60 s.**
+   - The 1-minute window had almost no traffic when the fault was removed.
+   - **The lesson:** how fast a rate or percentile reacts depends on *how much traffic is in the window*, not just on the window's length.
+
+## E5. The timeout-and-retry trap (effect on users)
+
+This is the most important finding of E1, and you can reproduce it in a minute.
+
+Switch on a delay for every request:
+
+```bash
+curl -s -XPUT localhost:8000/admin/faults -H 'content-type: application/json' -d '{"delay_ms":500,"delay_every_n":1,"error_every_n":0}'
+```
+
+Note dev-100's reading count:
+
+```bash
+curl -s localhost:8000/devices/dev-100 | jq .reading_count
+```
+
+Send one reading with a client that gives up after 250 ms. It will print `HTTP 000`, a timeout:
+
+```bash
+curl -s -o /dev/null -w 'HTTP %{http_code}\n' --max-time 0.25 -XPOST localhost:8000/readings -H 'content-type: application/json' -H 'X-Request-ID: me-timeout' -d "{\"device_id\":\"dev-100\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"temperature_c\":22,\"humidity_pct\":45,\"battery_pct\":88}"
+```
+
+Wait a second, then check the count again:
+
+```bash
+curl -s localhost:8000/devices/dev-100 | jq .reading_count
+```
+
+Switch the fault off:
+
+```bash
+curl -s -XDELETE localhost:8000/admin/faults
+```
+
+**Predict:** did the count go up, even though the client saw a failure? *(Yes. The server stored the reading after its sleep, and logged `201`. Search Kibana for `request_id : "me-timeout"`.)*
+
+If the client retries, the reading is stored twice. The general lesson: **a timeout tells you that you didn't get a reply, not that nothing happened.** That's why real ingestion APIs use idempotency keys.
+
+## E6. Run E2 yourself
+
+This runs the whole demo, and always cleans up afterwards:
+
+```bash
+scripts/cardinality_demo.sh /tmp/e2.json
+```
+
+Read the four snapshots in `/tmp/e2.json`. **Predict each value before you look:**
+
+| Snapshot | `count(demo_requests_total)` | `count(last_over_time(demo_requests_total[30m]))` |
+|---|---|---|
+| with the label | ? | ? |
+| label removed | ? | ? |
+| exporter stopped | ? | ? |
+
+<details><summary>Answers</summary>
+
+- **With the label:** 100 and 100.
+- **Label removed:** 1 and **101**. The old 100 are still stored.
+- **Exporter stopped:** 0 and **101**.
+
+If you've run the demo before within the last 30 minutes, even the "before" snapshot shows 101: those series are still in history.
+</details>
+
+**Then look at it in Prometheus** (http://localhost:9090/query). Put `count(demo_requests_total)` and `count(last_over_time(demo_requests_total[30m]))` in two panels, on the *Graph* tab, over the last 5 minutes.
+
+**Why it's safe:**
+- The demo has its own registry: `tests/test_cardinality_demo.py` checks that nothing reaches the app's metrics.
+- It's capped at 100 IDs in code.
+- It's an opt-in Compose profile (`e2`).
+- The targets file goes back to `[]` afterwards: check `cat monitoring/prometheus/file_sd/cardinality-demo.json`.
+
+**Now do the real calculation.** This app's latency histogram has 18 series per method-and-route pair. If `request_id` were a label on it, how many new series would 4 requests/s create per day? *(About 18 × 4 × 86,400 ≈ 6.2 million.)* Compare that with the total the app exposes today:
+
+```bash
+curl -s --get localhost:9090/api/v1/query --data-urlencode 'query=count({job="sensor-api"})' | jq -r '.data.result[0].value[1]'
+```
+
+## E7. From what you see to the report
+
+| Report section | How to verify it | How to change it |
+|---|---|---|
+| E.1 table | `docs/results/e1_server_*.json` and `e1_load_*.json`; re-run [E3](#e3-run-e1-yourself) | Re-run all three stages and replace the table *and* the screenshots together. The numbers must come from the same run |
+| E.1 predictions | `docs/results/e1_predictions.md` and its timestamp | Never edit predictions after the fact. Write new ones before a new run |
+| E.1 cause and effect | [E5](#e5-the-timeout-and-retry-trap-effect-on-users) | — |
+| E.2 table and screenshot | `docs/results/e2_cardinality.json`; [E6](#e6-run-e2-yourself) | Re-run `scripts/cardinality_demo.sh`. The first run of the day gives the cleanest "before" row |
+| Any screenshot | The Grafana/Kibana URLs in docs/BUILD_LOG.md (E1.6) | Recapture with a fixed time window, and re-interpret |
+
+## E8. Check yourself
+
+<details><summary>1. Why stop the simulator during E1?</summary>
+
+Its traffic varies (4 req/s, plus dev-019's 422s and dev-020's dropouts), and it would also shift the fault's every-Nth counter. With only the fixed-rate load, a change in the numbers can only come from the fault.
+</details>
+
+<details><summary>2. Why did p50 stay flat while p95 jumped?</summary>
+
+Only 20 % of requests were delayed. The median is the 50th-percentile request, which is still an undelayed one. Averages and medians hide problems that hit a minority of requests.
+</details>
+
+<details><summary>3. The histogram said p95 = 875 ms, the client measured 514 ms. Which is right?</summary>
+
+The client is right about the actual latency. The histogram only knows that the slow requests fell into the 0.5–1 s bucket, and it interpolates inside it. To make the histogram more precise, add bucket bounds near where the slow requests actually land (e.g. 0.6 s). This is the same lesson as B.4.
+</details>
+
+<details><summary>4. After removing the label, why does <code>count()</code> drop immediately but the history stays?</summary>
+
+On the next scrape, Prometheus marks the vanished series *stale*, so instant queries stop returning them. The samples it already stored stay until retention deletes them (7 days here). The growth stops; the cost already paid doesn't go away.
+</details>
+
+<details><summary>5. Where should "which requests were slow?" be answered: metrics or logs?</summary>
+
+Both, at different levels. **Metrics** say *how many* and *how slow* (p95, Apdex, faults per minute) cheaply, for all traffic. **Logs** say *which ones* (`request_id`, `device_id`, `duration_ms`), and are searched only when you need them.
+</details>
+
+---
+
 ## Glossary
 
 | Term | Meaning |
@@ -935,10 +1385,7 @@ No. It's a trade-off between cost, privacy and how far back you can investigate.
 | **Rollover / retention (ILM)** | Starting a new backing index / deleting old ones on a schedule |
 | **KQL** | Kibana Query Language: `field : value and …` |
 | **Registry** | Filebeat's record of how far it has read each file |
-
-## What Parts D–E will teach
-
-- **D: System design.** A diagram, plus "follow one metric, follow one log" end to end. You've done both halves: the metric in [A3](#a3-follow-one-reading-through-the-code) and [B2–B4](#b2-layer-1-the-raw-metrics-page), and the log in [C2–C6](#c2-layer-1-what-the-app-writes-stdout). You've also seen the failure modes: [B5](#b5-experiments-to-run-yourself) experiments 3–5 and [C7](#c7-experiments-to-run-yourself).
-- **E: Experiments.**
-  - **E1** is B5's experiment 1, done carefully: a baseline, a written prediction, a fault, a recovery, and each phase run for several scrapes. The fault now shows in *both* Grafana (latency percentiles) and Kibana (`event : "fault_injected"`, slow `http_request` lines).
-  - **E2** deliberately adds `request_id` as a label to a test counter, and shows B3 exercise 3's lesson at scale: the series count explodes, and removing the label doesn't delete the history.
+| **Open-loop load** | Requests started on a fixed schedule, regardless of replies, so the offered load stays constant |
+| **Idempotency key** | A client-chosen ID that lets the server recognise a retry and store it only once |
+| **Aliasing** | A signal sampled every *T* seconds missing, or distorting, something that repeats on a regular cycle of its own |
+| **Stale series** | A series Prometheus stopped receiving: hidden from instant queries, but still stored until retention removes it |

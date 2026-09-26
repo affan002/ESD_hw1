@@ -2,7 +2,7 @@
 
 This service receives readings from simulated temperature, humidity and battery sensors. It validates each reading, stores it and flags anomalies. It's the base application for an observability assignment (Prometheus/Grafana metrics and Filebeat → Elasticsearch → Kibana logs).
 
-> Status: Part A (the API, the dashboard and the simulator), Part B (Prometheus, Grafana and Node Exporter metrics) and Part C (the Filebeat → Elasticsearch → Kibana log pipeline) are complete.
+> Status: Part A (the API, the dashboard and the simulator), Part B (Prometheus, Grafana and Node Exporter metrics) and Part C (the Filebeat → Elasticsearch → Kibana log pipeline) are complete. Part D (system design) is documented in REPORT.md, with the architecture diagram in `docs/diagrams/`. Part E's experiments are reproducible with the scripts in `scripts/` (see *Experiments* below).
 
 ## Prerequisites
 
@@ -10,7 +10,8 @@ This service receives readings from simulated temperature, humidity and battery 
 - Your user must be able to talk to Docker without `sudo`. If you get `permission denied ... docker.sock`, run `sudo usermod -aG docker $USER`, then log out and back in.
 - Python 3.12. This is only needed to run the tests locally.
 - `curl`. `jq` is optional but useful.
-- Free ports on the host: **8000** (API and dashboard), **9090** (Prometheus), **3000** (Grafana), **9100** (Node Exporter), and **9200** (Elasticsearch) and **5601** (Kibana), which are bound to 127.0.0.1 only.
+- Free ports on the host: **8000** (API and dashboard), **9090** (Prometheus), **3000** (Grafana), **9200** (Elasticsearch) and **5601** (Kibana). **All of them are bound to 127.0.0.1**, so they're reachable only from this machine, not from your network: there's no login on `/admin/faults`, Grafana or Elasticsearch. Node Exporter listens on port **9100** of Docker's bridge address (172.17.0.1) only.
+- To open the UIs from another device, change the `127.0.0.1:` prefixes in `docker-compose.yml`, but only on a network you trust.
 - About **3.5 GB of free RAM** for the whole stack: Kibana uses about 1.7 GB and Elasticsearch about 1 GB. If you're short on memory, `docker compose stop kibana` frees about 1.7 GB, and logs keep flowing into Elasticsearch without it.
 - About 6 GB of disk for the images. Elasticsearch needs `vm.max_map_count` ≥ 262144 (`cat /proc/sys/vm/max_map_count`); Ubuntu 24.04's default of 1048576 is fine.
 
@@ -79,6 +80,12 @@ To go straight to a dashboard:
 
 The datasource and dashboards are **provisioned from files** in `monitoring/grafana/`, so they come back identically after `docker compose down -v`. Changes made in the UI can't be saved. To change a dashboard, edit its JSON in `monitoring/grafana/dashboards/`, and Grafana reloads it within 30 s. To make edits in the UI and export them, log in as `admin` / `admin` (Grafana asks you to change the password on first login).
 
+The architecture diagram is Mermaid text, `docs/diagrams/architecture.mmd`. After editing it, re-render the SVG and PNG with headless Chrome (this fetches Mermaid from jsDelivr once):
+
+```bash
+scripts/render_diagram.sh
+```
+
 To regenerate the report's screenshots (headless Chrome over a fixed time window; the stack must be running), capture the last 30 minutes, or pass an explicit end time:
 
 ```bash
@@ -109,7 +116,7 @@ Or query from the terminal:
 curl -s --get localhost:9090/api/v1/query --data-urlencode 'query=sensor_devices' | jq -c '.data.result[] | {status: .metric.status, value: .value[1]}'
 ```
 
-**Host metrics:** the `node-exporter` service reports CPU, memory, disk and network for the machine running Docker. It uses the host network, so it's at http://localhost:9100/metrics. Try `node_load1`, or `node_memory_MemAvailable_bytes / 1024^3`, in the Prometheus UI.
+**Host metrics:** the `node-exporter` service reports CPU, memory, disk and network for the machine running Docker. It uses the host network and listens only on Docker's bridge address, so from this machine it's at http://172.17.0.1:9100/metrics (not `localhost`). Try `node_load1`, or `node_memory_MemAvailable_bytes / 1024^3`, in the Prometheus UI.
 
 Prometheus keeps its data in the `prometheus-data` volume for 7 days. `docker compose down -v` deletes it along with the app's data.
 
@@ -123,6 +130,7 @@ The API and the simulator write one JSON object per line to stdout. **Filebeat**
 |---|---|
 | Everything for one request | `request_id : "<id>"`. The ID is in the `X-Request-ID` response header, or shown by the dashboard's *Send a test reading* box |
 | Warnings and errors | `level : ("ERROR" or "WARNING")` |
+| Only errors (server failures, crashes) | `level : "ERROR"`. Normally there are none. To produce some, switch on the error fault for 30 s (see *Inject and undo a fault*), then turn it off |
 | Why readings were rejected | `event : "reading_rejected"` (add the columns `errors.field` and `errors.type`) |
 | Slow requests | `event : "http_request" and duration_ms > 100` |
 | One device | `device_id : "dev-019"` |
@@ -154,6 +162,60 @@ curl -s 'localhost:9200/_cat/indices/.ds-sensor-logs*?v&h=index,docs.count,creat
 ```bash
 docker compose logs filebeat --no-log-prefix | jq -r 'select(.["log.level"]!="info") | .message' | tail
 ```
+
+### Experiments (Part E)
+
+**E1: fault injection with a steady load.** Stop the simulator, so the only `POST /readings` traffic is the load script's:
+
+```bash
+docker compose stop simulator
+```
+
+Wait about 70 s for its traffic to leave the 1-minute window. Then run a baseline: 5 requests/s for 150 s, IDs `load-baseline-NNNNN`, standard-library Python only:
+
+```bash
+python3 scripts/load.py --stage baseline --rate 5 --duration 150 --out /tmp/baseline.json
+```
+
+Compute the server-side figures (percentiles, Apdex, faults, log counts) for exactly that stage's window:
+
+```bash
+python3 scripts/e1_stage_stats.py baseline $(jq -r .start_utc /tmp/baseline.json) $(jq -r .end_utc /tmp/baseline.json)
+```
+
+Switch on the fault used in the report, 500 ms on every 5th reading:
+
+```bash
+curl -s -XPUT localhost:8000/admin/faults -H 'content-type: application/json' -d '{"delay_ms":500,"delay_every_n":5,"error_every_n":0}'
+```
+
+Run the same load with `--stage fault` and compute its figures in the same way. Then switch the fault off. This is the undo step, and a restart also resets it:
+
+```bash
+curl -s -XDELETE localhost:8000/admin/faults
+```
+
+Run the same load once more with `--stage recovery`. Finally, restart the simulator:
+
+```bash
+docker compose start simulator
+```
+
+The report's own raw results are in `docs/results/`.
+
+**E2: cardinality explosion.** This runs a throwaway exporter with its own metrics registry, capped at 100 unique IDs. It starts the exporter with a `request_id` label, then without it, and prints the series counts. It always cleans up afterwards (the exporter is stopped, and the Prometheus targets file goes back to `[]`):
+
+```bash
+scripts/cardinality_demo.sh /tmp/e2.json
+```
+
+Check that nothing is left behind. This should print `[]`, and the service shouldn't be listed:
+
+```bash
+cat monitoring/prometheus/file_sd/cardinality-demo.json; docker compose --profile e2 ps -a
+```
+
+The demo's series stay in Prometheus's history until retention removes them (7 days). To remove them immediately, `docker compose down -v` deletes all metrics history.
 
 ### Run the device simulator
 
@@ -359,5 +421,6 @@ docker image rm sensor-api:dev
 Remove the downloaded monitoring images:
 
 ```bash
+docker compose --profile e2 rm -sf cardinality-demo   # only if the E2 demo was interrupted
 docker image rm prom/prometheus:v3.15.0 prom/node-exporter:v1.12.1 grafana/grafana:13.2.2 elasticsearch:9.5.3 kibana:9.5.3 elastic/filebeat:9.5.3 curlimages/curl:8.16.0
 ```

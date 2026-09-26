@@ -21,6 +21,14 @@ scrape_configs:
     static_configs:
       - targets: ["host.docker.internal:9100"]
 
+  # Experiment E2 only (scripts/cardinality_demo.sh). Targets come from
+  # file_sd/cardinality-demo.json, which holds [] except while the demo runs,
+  # so normally this job has no targets and nothing shows as down.
+  - job_name: cardinality-demo
+    file_sd_configs:
+      - files: ["/etc/prometheus/file_sd/*.json"]
+        refresh_interval: 5s
+
   # Prometheus's own metrics (scrape health, TSDB size, series count).
   - job_name: prometheus
     static_configs:

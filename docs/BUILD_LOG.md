@@ -4,7 +4,9 @@ The stage-by-stage evidence behind [REPORT.md](../REPORT.md): what was built at 
 
 - [Part A: the app](#part-a-the-app) (stages 0–9)
 - [Part B: metrics](#part-b-metrics) (stages B0–B9)
-- [Part C: logs](#part-c-logs) (stages C0–C7)
+- [Part C: logs](#part-c-logs) (stages C0–C9)
+- [Part D: system design](#part-d-system-design) (stages D1–D3)
+- [Part E: experiments](#part-e-experiments) (E1.1–E1.6, E2.1–E2.4)
 
 ---
 
@@ -837,4 +839,379 @@ The rollovers came every 10–11 min (17:36, 17:46, 17:57, 18:08, 18:19, 18:30),
 **Memory with the whole stack running:** Kibana 1.73 GiB, Elasticsearch 1.01 GiB, Grafana 403 MiB, Filebeat 92 MiB, Prometheus 65 MiB, API 42 MiB. Host RAM available: 939 MiB.
 
 **A watcher mistake worth recording:** my first deletion watcher reported "000001 GONE at 17:44:36Z". That was during `docker compose down`, when Elasticsearch was unreachable, and the check "index not listed" can't tell "deleted" from "no answer". The index was still there after `up`. The watcher now skips a check when Elasticsearch doesn't answer.
+
+#### Stage C8 — Localhost-only ports (security fix)
+
+**Found:** the API (8000, including `/admin/faults`), Grafana (3000) and Prometheus (9090) listened on `0.0.0.0` and `[::]`, and Node Exporter on `*:9100`. That made all four reachable from the Wi-Fi address (192.168.1.8). Elasticsearch and Kibana were already on 127.0.0.1.
+
+**Fixed:**
+- `ports: "127.0.0.1:…"` for `api`, `prometheus` and `grafana`.
+- `--web.listen-address=172.17.0.1:9100` for `node-exporter`, which runs on the host network. That's Docker's bridge address, which `host.docker.internal` resolves to inside `prometheus`.
+```
+listeners:  127.0.0.1:3000  127.0.0.1:5601  127.0.0.1:8000  127.0.0.1:9090  127.0.0.1:9200  172.17.0.1:9100
+from the laptop:     localhost:8000/health 200 · localhost:3000/api/health 200 · localhost:9090/-/ready 200 · 172.17.0.1:9100/metrics 200
+via 192.168.1.8:     8000 000 · 3000 000 · 9090 000 · 9100 000 · 9200 000 · 5601 000   (connection refused)
+prometheus targets:  node up · prometheus up · sensor-api up
+```
+
+#### Stage C9 — Searching for errors (a 30-second error fault)
+
+`PUT /admin/faults {"error_every_n":10}` at 18:54:26.204Z (`request_id` c-error-on), then `DELETE` at 18:54:56.243Z (c-error-off).
+```
+level:ERROR, by event:              fault_injected 11 · http_request 11           (22 documents, all sensor-api)
+event:http_request and status>=500: 11                                           (was 0 before)
+simulator sim_send_failed 500:      11
+one failed request, sim-e2306ccbc8f2:
+  18:54:28.541Z sensor-api ERROR   fault_injected  "injected error"
+  18:54:28.543Z sensor-api ERROR   http_request    "POST /readings -> 500"  status 500
+  18:54:28.550Z simulator  WARNING sim_send_failed "reading not accepted: HTTP 500"  dev-014
+fault_config_changed: 18:54:26.204Z c-error-on {error_every_n:10} · 18:54:56.243Z c-error-off {error_every_n:0}
+```
+Counted 8 s after the fault ended, the first numbers were 10 / 10 / 11, and only the "on" config change had arrived. Re-counted a little later, everything was 11 / 11 / 11 and both changes were there. Filebeat and the index refresh add a few seconds of delay. The screenshots are `c_kibana_errors.png` and `c_kibana_error_trace.png`.
+
+---
+
+## Part D: system design
+
+#### Stage D1 — Failure modes, tested one component at a time
+
+**Method:** `d1_fail.sh <service> <seconds>` (a scratch script):
+1. `docker compose stop <service>`.
+2. Probe: API `POST /readings` with `X-Request-ID: d1-<service>`, `GET /devices`, `/`, `/metrics`; Prometheus ready and targets; a Grafana `/api/ds/query` for `up`; the Elasticsearch count; Kibana `/api/status`.
+3. Wait, and count the simulator's `sim_send_failed` during the outage.
+4. `docker compose start`, wait until healthy, and check whether the tagged reading reached Elasticsearch and how many `up{job="sensor-api"}` samples exist in the window.
+
+`000` means connection refused. (The Elasticsearch count falls between runs as retention deletes old backing indices.)
+
+**Prometheus** (down 35 s):
+```
+=== stop prometheus at 19:21:53
+--- while prometheus is down:
+  api POST /readings : 201
+  api GET /devices   : 200    dashboard GET / : 200    /metrics : 200
+  prometheus ready   : 000    targets: 
+  grafana query 'up' : ERROR: Post "http://prometheus:9090/api/v1/query": dial tcp: lookup prometheus on 127.0.0.11:53: 
+  elasticsearch docs : 32434    kibana /api/status : 200
+--- simulator during the outage:       1 422 
+=== start prometheus at 19:22:29 (down ~35 s)
+--- after recovery (19:22:46):
+  tagged reading d1-prometheus in elasticsearch: 2 docs
+  prometheus samples of up{job=sensor-api} in the last 70 s: 6 (expected 14 at 5 s)
+  sensor-api up=0 samples in that window: 0
+  api POST /readings : 201
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 32764    kibana /api/status : 200
+```
+**Grafana** (down 25 s):
+```
+=== stop grafana at 19:23:05
+--- while grafana is down:
+  api POST /readings : 201
+  api GET /devices   : 200    dashboard GET / : 200    /metrics : 200
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : 
+  elasticsearch docs : 33029    kibana /api/status : 200
+--- simulator during the outage:       1 422 
+=== start grafana at 19:23:31 (down ~25 s)
+--- after recovery (19:23:52):
+  tagged reading d1-grafana in elasticsearch: 2 docs
+  prometheus samples of up{job=sensor-api} in the last 60 s: 12 (expected 12 at 5 s)
+  sensor-api up=0 samples in that window: 0
+  api POST /readings : 201
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 33386    kibana /api/status : 200
+```
+**Node Exporter** (down 25 s):
+```
+=== stop node-exporter at 19:23:53
+--- while node-exporter is down:
+  api POST /readings : 201
+  api GET /devices   : 200    dashboard GET / : 200    /metrics : 200
+  prometheus ready   : 200    targets: node=down prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 33473    kibana /api/status : 200
+--- simulator during the outage: 
+=== start node-exporter at 19:24:18 (down ~25 s)
+--- after recovery (19:24:38):
+  tagged reading d1-node-exporter in elasticsearch: 2 docs
+  prometheus samples of up{job=sensor-api} in the last 60 s: 12 (expected 12 at 5 s)
+  sensor-api up=0 samples in that window: 0
+  api POST /readings : 201
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 33817    kibana /api/status : 200
+node samples in last 60 s: 12, of which up=0: 6
+```
+**Elasticsearch** (down 50 s). Filebeat's own log during the outage, and the documents per 10 s indexed afterwards:
+```
+=== stop elasticsearch at 19:24:59
+--- while elasticsearch is down:
+  api POST /readings : 201
+  api GET /devices   : 200    dashboard GET / : 200    /metrics : 200
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs :     kibana /api/status : 000
+--- simulator during the outage:       4 422 
+=== start elasticsearch at 19:25:56 (down ~50 s)
+--- after recovery (19:26:47):
+  tagged reading d1-elasticsearch in elasticsearch: 2 docs
+  prometheus samples of up{job=sensor-api} in the last 85 s: 17 (expected 17 at 5 s)
+  sensor-api up=0 samples in that window: 0
+  api POST /readings : 201
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 34956    kibana /api/status : 200
+filebeat: 19:25:07 error failed to perform any bulk index operations … lookup elasticsearch … server misbehaving
+          19:25:08 info  Connecting to backoff(elasticsearch(http://elasticsearch:9200))
+          19:25:09 info  Attempting to reconnect to backoff(elasticsearch(http://elasticsearch:9200)) with 1 reconnect attempt(s)
+docs per 10 s (19:24:50 → 19:26:40): 11 94 89 88 92 88 84 81 85 83 86 45   ← no gap: the outage's logs were delivered afterwards
+```
+**Kibana** (down 35 s):
+```
+=== stop kibana at 19:27:09
+--- while kibana is down:
+  api POST /readings : 201
+  api GET /devices   : 200    dashboard GET / : 200    /metrics : 200
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 35135    kibana /api/status : 000
+--- simulator during the outage:       2 422 
+=== start kibana at 19:27:45 (down ~35 s)
+--- after recovery (19:28:43):
+  tagged reading d1-kibana in elasticsearch: 2 docs
+  prometheus samples of up{job=sensor-api} in the last 70 s: 14 (expected 14 at 5 s)
+  sensor-api up=0 samples in that window: 0
+  api POST /readings : 201
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 35921    kibana /api/status : 200
+Elasticsearch docs kept growing (35135 → 35921): ingestion doesn't need Kibana.
+```
+**API** (down 35 s):
+```
+=== stop api at 19:28:43
+--- while api is down:
+  api POST /readings : 000
+  api GET /devices   : 000    dashboard GET / : 000    /metrics : 000
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=down
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 36009    kibana /api/status : 200
+--- simulator during the outage:     140 ConnectError       1 ConnectTimeout 
+=== start api at 19:29:20 (down ~35 s)
+--- after recovery (19:29:37):
+  tagged reading d1-api in elasticsearch: 0 docs
+  prometheus samples of up{job=sensor-api} in the last 70 s: 14 (expected 14 at 5 s)
+  sensor-api up=0 samples in that window: 7
+  api POST /readings : 201
+  prometheus ready   : 200    targets: node=up prometheus=up sensor-api=up
+  grafana query 'up' : ok (3 series)
+  elasticsearch docs : 36162    kibana /api/status : 200
+raw counter after the restart: sensor_readings_total{outcome="normal"} = 59.0   (reset to 0 at start)
+sum(rate(sensor_readings_total[1m])) every 10 s: 19:28:43 3.82 · 19:28:53 3.35 · 19:29:03 2.72 · 19:29:13 2.09 · 19:29:23 1.45 · 19:29:33 1.15
+```
+**Simulator** (down 40 s):
+```
+after 40 s: devices {"stale":21} · sensor_devices gauge {"ok":"0","anomaly":"0","stale":"21"} · api health 200
+simulator's last line (on SIGTERM): {"event":"sim_summary","message":"simulator final summary","stats":{"sent":24644,"status_201":24067,"status_422":389,"status_5xx":11,"status_other":0,"conn_errors":177}}
+restarted: after 20 s, devices {"ok":20,"stale":1}   (dev-100 = a manual test device, silent since)
+```
+**Docker log buffer size:** the API's log file grew 5,456,744 bytes between the container starting (18:53:33Z) and 19:21:16Z, i.e. about **3.3 KB/s**. With `max-size: 10m` × `max-file: 3` that's about **30 MB ≈ 2.5 h** of API logs. That's how long Filebeat or Elasticsearch can be down before log lines are actually lost.
+
+**Not tested, reasoned from configuration:**
+- `logs-setup` failing: `filebeat` has `depends_on: logs-setup: condition: service_completed_successfully`, so Filebeat wouldn't start at all. Logs would wait in Docker's files, within the same 2.5 h window.
+- Filebeat stopping: tested in C7 (caught up from its registry, no duplicates).
+
+#### Stage D1b — Architecture diagram
+
+**Built:**
+- `docs/diagrams/architecture.mmd`: a Mermaid flowchart with every service, arrow, storage location and "stops →" note, taken from `docker-compose.yml`, `monitoring/` and the D1 results.
+- `scripts/render_diagram.sh`, which renders it with headless Chrome and Mermaid 11 from jsDelivr: the SVG from `--dump-dom`, and the PNG from a 2× screenshot.
+
+The first render used `flowchart LR` and was 2382×696, unreadable when scaled to page width. The switch to `TB` gives 3235×4925 at 2×.
+
+**Simplified afterwards.** The version with a failure note in every box was too dense to read at a glance. The diagram now shows only the components, their groups (Clients, sensor-api, Metrics, Logs, plus the one-shot logs-setup) and one short label per arrow, drawn `LR` at 3540×1233 (2×). The failure behaviour and the storage and retention detail moved to REPORT D.1–D.2, where they were already listed as tables. The `docker.sock` and "Filebeat waits for logs-setup" arrows were dropped from the drawing; they're described in D.1's text and the walkthrough.
+```
+$ scripts/render_diagram.sh
+wrote docs/diagrams/architecture.svg
+wrote docs/diagrams/architecture.png
+```
+
+#### Stage D2 — Follow a metric: `sensor_anomalies_total{reason="humidity_low"}`
+
+This series was chosen because no simulated device produces `humidity_low`, and the counter had been reset to 0 by the D1 API restart. So a single reading moves it from 0 to 1, with nothing else mixed in.
+```
+BEFORE  app /metrics: sensor_anomalies_total{reason="humidity_low"} 0.0   prometheus: 0
+POST /readings  X-Request-ID d2-follow-1  humidity_pct 10  → {"id":145080,"is_anomaly":true,"anomaly_reasons":["humidity_low"],"received_at":"2026-09-26T19:33:16.563Z"}
+sent at 19:33:16.554
+AFTER   app /metrics (immediately): sensor_anomalies_total{reason="humidity_low"} 1.0
+prometheus shows 1 after 2.2 s
+raw samples stored (query sensor_anomalies_total{reason="humidity_low"}[40s]):
+  19:32:43 0 · 19:32:48 0 · 19:32:53 0 · 19:32:58 0 · 19:33:03 0 · 19:33:08 0 · 19:33:13 0 · 19:33:18 1
+scrape: lastScrape 19:33:18.449, duration 0.0096 s, interval 5 s
+panel query sum by (reason) (increase(sensor_anomalies_total{reason="humidity_low"}[1m])), every 5 s:
+  19:33:16 0 · 19:33:21 1.05 · … (1.05 throughout) … · 19:34:11 1.05 · 19:34:16 0
+Grafana /api/ds/query (the same panel expression), instant at 19:33:40:
+  temperature_low 0 · temperature_high 12 · humidity_low 1.0282 · humidity_high 0 · battery_low 12
+```
+The screenshots are `d_prometheus_raw_counter.png` and `d_grafana_anomalies_by_reason.png`.
+
+#### Stage D3 — Follow a log: the same reading's `anomaly_detected` line
+```
+1. app stdout:
+{"timestamp": "2026-09-26T19:33:16.567Z", "level": "WARNING", "service": "sensor-api", "logger": "app", "event": "anomaly_detected", "message": "anomaly detected: humidity_low", "request_id": "d2-follow-1", "device_id": "dev-100", "reading_id": 145080, "anomaly_reasons": ["humidity_low"], "temperature_c": 22.0, "humidity_pct": 10.0, "battery_pct": 88.0}
+2. Docker's file /var/lib/docker/containers/ae33aec25ed1…/ae33aec25ed1…-json.log:
+{"log":"{\"timestamp\": \"2026-09-26T19:33:16.567Z\", … \"battery_pct\": 88.0}\n","stream":"stdout","time":"2026-09-26T19:33:16.567348287Z"}
+3. filebeat (autodiscover started this container's input when the container was created):
+2026-09-26T18:53:34.029Z Input 'filestream' starting id=container-ae33aec25ed19b02f7df5fcba7fe2ad3ba7a206f6374176a4729df02e39efc0a
+4. stored: _index .ds-sensor-logs-2026.09.26-000017, _id odk136ABdEksZtjUOIBI
+{"@timestamp":"2026-09-26T19:33:16.567Z","stream":"stdout","service":"sensor-api","device_id":"dev-100","temperature_c":22,"battery_pct":88,
+ "event":"anomaly_detected","message":"anomaly detected: humidity_low","host":{"name":"31f3c20d3332"},"anomaly_reasons":["humidity_low"],
+ "level":"WARNING","humidity_pct":10,"logger":"app","container":{"id":"ae33aec25ed1…","name":"esd_hw1-api-1","image":{"name":"sensor-api:dev"}},
+ "request_id":"d2-follow-1","reading_id":145080}          (+ log.original = line 1)
+elasticsearch had all 3 docs for d2-follow-1 after 6.6 s:
+  19:33:16.567 INFO reading_stored · 19:33:16.567 WARNING anomaly_detected [humidity_low] · 19:33:16.568 INFO http_request POST /readings -> 201 (5.9 ms)
+```
+The screenshot is `d_kibana_follow_log.png`.
+
+**Found while tracing (now an open question):** the backing indices are numbered with odd numbers only from `-000007` on. `_data_stream` reports `generation: 18` with 6 indices (`000007, 000009, …, 000017`). The failure store is disabled and has no indices (`"failure_store":{"enabled":false,"rollover_on_write":true,"indices":[]}`). `-000017` was created at 19:27:28Z, about 2 min later than the 10-minute schedule, right after the D1 Elasticsearch restart (19:25–19:26).
+
+---
+
+## Part E: experiments
+
+Raw outputs are saved in `docs/results/`: `e1_load_<stage>.json` (the client's view), `e1_server_<stage>.json` (Prometheus and Elasticsearch over the stage window), `e1_predictions.md` and `e2_cardinality.json`.
+
+#### Stage E1.1 — Repeatable load
+
+**Built:**
+- `scripts/load.py`: open-loop `POST /readings` at a fixed rate, from a thread pool of 32 workers. Each request is a normal reading for `dev-100` with `X-Request-ID: load-<stage>-NNNNN`. It prints a JSON summary with client-side percentiles.
+- `scripts/e1_stage_stats.py <stage> <start> <end>`: computes the stage's server-side figures from Prometheus, evaluated at the stage end over `[duration − 15 s]` (the 15 s margin excludes the previous stage), plus log counts from Elasticsearch.
+```
+$ python3 scripts/load.py --stage dryrun --rate 5 --duration 10
+{"stage": "dryrun", "sent": 50, "status_counts": {"201": 50}, "client_latency_ms": {"p50": 12.6, "p95": 15.2, "p99": 39.5, "max": 39.5, "mean": 12.4}}
+```
+
+#### Stage E1.2 — Baseline (faults off, simulator stopped)
+
+The simulator was stopped at about 20:32:00Z, and I waited 70 s so its requests had left the 1-minute window. That way only `load.py` hits `POST /readings`.
+```
+$ python3 scripts/load.py --stage baseline --rate 5 --duration 150
+{"stage": "baseline", "start_utc": "2026-09-26T20:33:09.564Z", "end_utc": "2026-09-26T20:35:39.365Z", "rate_per_s": 5.0, "sent": 750, "status_counts": {"201": 750}, "client_latency_ms": {"p50": 12.7, "p95": 13.9, "p99": 16.1, "max": 32.1, "mean": 11.6}}
+$ python3 scripts/e1_stage_stats.py baseline 2026-09-26T20:33:09.564Z 2026-09-26T20:35:39.365Z
+{"stage": "baseline", "window_utc": ["2026-09-26T20:33:09.564Z", "2026-09-26T20:35:39.365Z"], "promql_range": "134s", "server_requests": 670, "server_p50_s": 0.0119, "server_p95_s": 0.0147, "server_p99_s": 0.015, "server_mean_s": 0.0111, "apdex_T25ms": 1.0, "share_over_500ms": 0.0, "http_5xx": 0, "faults_injected_delay": 0, "fault_active_delay_max": 0.0, "db_write_mean_s": 0.0046, "logs_this_stage_http_request": 750, "logs_fault_injected": 0, "logs_http_request_over_400ms": 0, "logs_level_error": 0}
+```
+
+#### Stage E1.3 — Prediction
+
+`docs/results/e1_predictions.md` was written at **20:36:33Z**, 17 s before the fault was switched on (20:36:50.732Z). It holds 17 numbered predictions (P1–P17), mostly numeric, derived from the baseline and the histogram's bucket bounds.
+
+#### Stage E1.4 — Introduce the fault (`delay_ms=500, delay_every_n=5`)
+```
+fault on at 20:36:50.732Z: PUT /admin/faults {"delay_ms":500,"delay_every_n":5,"error_every_n":0}   (X-Request-ID e1-fault-on)
+$ python3 scripts/load.py --stage fault --rate 5 --duration 150
+{"stage": "fault", "start_utc": "2026-09-26T20:36:50.857Z", "end_utc": "2026-09-26T20:39:20.657Z", "rate_per_s": 5.0, "sent": 750, "status_counts": {"201": 750}, "client_latency_ms": {"p50": 13.0, "p95": 513.9, "p99": 514.7, "max": 528.5, "mean": 112.1}}
+{"stage": "fault", "window_utc": ["2026-09-26T20:36:50.857Z", "2026-09-26T20:39:20.657Z"], "promql_range": "134s", "server_requests": 670, "server_p50_s": 0.0128, "server_p95_s": 0.875, "server_p99_s": 0.975, "server_mean_s": 0.1115, "apdex_T25ms": 0.8, "share_over_500ms": 0.2, "http_5xx": 0, "faults_injected_delay": 134, "fault_active_delay_max": 1.0, "db_write_mean_s": 0.0047, "logs_this_stage_http_request": 750, "logs_fault_injected": 149, "logs_http_request_over_400ms": 149, "logs_level_error": 0}
+first delayed ids: load-fault-00004 load-fault-00009 load-fault-00014 load-fault-00019 load-fault-00024 load-fault-00029 load-fault-00034 load-fault-00039
+delayed ids NOT ending in 4 or 9: 0
+fault_injected for load-fault-* (no time bound): 150 · raw counter sensor_faults_injected_total{fault="delay"} 150.0
+last delayed: load-fault-00749 at 20:39:20.662Z (5 ms after end_utc, which is why the time-bounded log count says 149)
+requests_in_progress over the stage: max 2, avg 1.04 · scrape timestamps …188.449 …193.449 …198.449 (always .449 s past the second)
+```
+
+| # | Prediction | Result | |
+|---|---|---|---|
+| P1 | p50 unchanged, about 12 ms | 12.8 ms | ✔ |
+| P2 | `histogram_quantile` p95 / p99 = 0.875 / 0.975 s | **0.875 / 0.975 s** | ✔ exactly |
+| P3 | true p95 about 515 ms | client p95 513.9 ms, p99 514.7 ms | ✔ |
+| P4 | mean about 111 ms | 111.5 ms | ✔ |
+| P5 | Apdex 0.80 | 0.80 | ✔ |
+| P6 | 20 % > 500 ms | 0.20 | ✔ |
+| P7 | +150 delays, about 60/min | 150; panel plateau at 60/min | ✔ |
+| P8 | `fault_active` 1 during the stage | max 1.0 | ✔ |
+| P9 | no 5xx, rate still 5 /s | 0 5xx, 750/750 × 201 | ✔ |
+| P10 | DB write unchanged | 4.7 ms (was 4.6) | ✔ |
+| P11 | in-flight often 2 | **avg 1.04, max 2** | ✘: aliasing (see below) |
+| P12 | `fault_config_changed` on and off | 20:36:50.762Z (e1-fault-on), 20:41:18.861Z (e1-fault-off) | ✔ |
+| P13 | 150 `fault_injected`, 0 ERROR | 150, 0 | ✔ |
+| P14 | 150 `http_request` > 400 ms, only in the fault stage | 149 in the window (150 in total); 0 in baseline and recovery | ✔ |
+| P15 | delayed IDs end in 4 or 9 | all 150 | ✔ |
+
+**Why P11 failed:**
+- The load starts a request every 0.2 s from 20:36:50.857. The delayed ones (n = 4, 9, …) start at .657 past each second and sleep 500 ms, so they're in flight from .657 to .157.
+- Prometheus scrapes at .449 every 5 s, always in the half-second when no delayed request is in flight.
+- A gauge sampled every 5 s can systematically miss something that happens on a regular 1 s cycle (aliasing).
+
+#### Stage E1.5 — Effect on a caller with a short timeout
+
+The fault was still on, with the counter at 750. I sent 5 readings with `curl --max-time 0.25`, sharing one device timestamp and with temperatures 23.1–23.5; the 5th was request #755, a delayed one. Then I retried #5 with the identical body.
+```
+dev-100 reading_count before: 1579
+e1-timeout-1 -> HTTP 201 after 0.005296s
+e1-timeout-2 -> HTTP 201 after 0.005325s
+e1-timeout-3 -> HTTP 201 after 0.005542s
+e1-timeout-4 -> HTTP 201 after 0.005259s
+e1-timeout-5 -> HTTP 000 after 0.250673s        ← the client gave up
+e1-timeout-5-retry -> HTTP 201 after 0.012265s
+dev-100 reading_count after: 1585                ← 5 readings sent, 6 stored
+server logs:
+  20:40:34.260 e1-timeout-5        WARNING fault_injected
+  20:40:34.542 e1-timeout-5-retry  INFO    reading_stored 160160
+  20:40:34.547 e1-timeout-5-retry  INFO    http_request 201 12.4 ms
+  20:40:34.770 e1-timeout-5        INFO    reading_stored 160161          ← the original is stored after all
+  20:40:34.773 e1-timeout-5        INFO    http_request 201 514.14 ms     ← the server logs success
+stored: {"id":160161,"timestamp":"2026-09-26T20:40:34.000Z","temperature_c":23.5}, {"id":160160,…same…}
+```
+
+#### Stage E1.6 — Recovery
+```
+fault off at 20:41:18.848Z: DELETE /admin/faults   (X-Request-ID e1-fault-off)
+$ python3 scripts/load.py --stage recovery --rate 5 --duration 150
+{"stage": "recovery", "start_utc": "2026-09-26T20:41:18.961Z", "end_utc": "2026-09-26T20:43:48.761Z", "rate_per_s": 5.0, "sent": 750, "status_counts": {"201": 750}, "client_latency_ms": {"p50": 12.7, "p95": 13.9, "p99": 17.6, "max": 34.5, "mean": 11.8}}
+{"stage": "recovery", "window_utc": ["2026-09-26T20:41:18.961Z", "2026-09-26T20:43:48.761Z"], "promql_range": "134s", "server_requests": 670, "server_p50_s": 0.0119, "server_p95_s": 0.0147, "server_p99_s": 0.015, "server_mean_s": 0.0112, "apdex_T25ms": 1.0, "share_over_500ms": 0.0, "http_5xx": 0, "faults_injected_delay": 0, "fault_active_delay_max": 0.0, "db_write_mean_s": 0.0046, "logs_this_stage_http_request": 750, "logs_fault_injected": 0, "logs_http_request_over_400ms": 0, "logs_level_error": 0}
+Grafana panel p95 ([1m]) every 10 s after the DELETE:
+20:41:08 850ms 20:41:18 850ms 20:41:28 29ms 20:41:38 21ms 20:41:48 15ms 20:41:58 15ms … 20:42:48 15ms
+```
+**P16 ✔:** the recovery numbers are identical to the baseline.
+
+**P17 ✘:** I predicted about 60 s to recover; it took about 10 s. Between the fault stage's end (20:39:20) and the `DELETE`, there was no load apart from the 6 timeout-test requests. So the 1-minute window held just 1 slow request, and the first 50 fast recovery requests pushed it below the 95th percentile. With the load continuing across the switch, slow requests would have stayed above 5 % of the window for about 45 s.
+
+The screenshots, over 20:32:30–20:44:30Z, are `e_grafana_latency_three_stages.png`, `e_grafana_apdex_three_stages.png`, `e_grafana_faults_injected.png` and `e_kibana_slow_requests.png`. The simulator was restarted afterwards.
+
+#### Stage E2.1 — The throwaway exporter and its wiring
+
+**Built:**
+- `scripts/cardinality_demo.py`: its own `CollectorRegistry()`, so there are no default collectors and it isn't the app's registry. It has a `demo_requests_total` counter, with `--mode label` (one series per `req-0000…0099`, hard cap `MAX_IDS = 100`) or `--mode nolabel`, and serves `:8001`.
+- A Compose service `cardinality-demo` in profile **`e2`**, so it isn't started by `up`. It uses the `sensor-api:dev` image, mounts `./scripts` read-only, and takes `DEMO_MODE=label|nolabel`.
+- A Prometheus job `cardinality-demo` with `file_sd_configs` on `monitoring/prometheus/file_sd/*.json` (refresh 5 s). The file holds `[]` except during the demo. `prometheus` mounts `file_sd/` read-only and was recreated once, keeping its history (358 samples of `up` in 30 min).
+- `scripts/cardinality_demo.sh`, which runs the sequence and always cleans up (a `trap` removes the container and resets the targets file to `[]`).
+```
+docker compose config --services | grep -c cardinality-demo          → 0 (not in the default stack)
+docker compose --profile e2 config --services | grep -c cardinality-demo → 1
+cardinality-demo targets with the file at []: 0 (nothing shown as down)
+```
+
+#### Stages E2.2–E2.3 — Series growth, then removing the label
+
+The first run, `scripts/cardinality_demo.sh`:
+```
+stage          t          count(demo_requests_total)  sum  count(last_over_time(…[30m]))  samples scraped  prometheus_tsdb_head_series
+before         20:46:39Z  0                           0    0                              0                2830
+with_label     20:46:51Z  100                         100  100                            100              2972
+without_label  20:47:04Z  1                           100  101                            1                3009
+after_cleanup  20:47:16Z  0                           0    101                            0                3009
+series Prometheus stored: demo_requests_total{request_id="req-0000"} 1, …{request_id="req-0001"} 1, …
+afterwards: targets file [], demo container gone, 0 demo_* series in job sensor-api
+```
+The second run, after fixing the "series added" query to `max_over_time(scrape_series_added{job="cardinality-demo"}[20s])`:
+```
+{"stage": "before", "t": "2026-09-26T20:47:59Z", "count(demo_requests_total)": "0", "sum(demo_requests_total)": "0", "count(last_over_time(demo_requests_total[30m]))": "101", "max scrape_series_added (20s)": "0", "scrape_samples_scraped": "0", "prometheus_tsdb_head_series": "3009"}
+{"stage": "with_label", "t": "2026-09-26T20:48:12Z", "count(demo_requests_total)": "100", "sum(demo_requests_total)": "100", "count(last_over_time(demo_requests_total[30m]))": "101", "max scrape_series_added (20s)": "100", "scrape_samples_scraped": "100", "prometheus_tsdb_head_series": "3045"}
+{"stage": "without_label", "t": "2026-09-26T20:48:24Z", "count(demo_requests_total)": "1", "sum(demo_requests_total)": "100", "count(last_over_time(demo_requests_total[30m]))": "101", "max scrape_series_added (20s)": "100", "scrape_samples_scraped": "1", "prometheus_tsdb_head_series": "3081"}
+{"stage": "after_cleanup", "t": "2026-09-26T20:48:37Z", "count(demo_requests_total)": "0", "sum(demo_requests_total)": "0", "count(last_over_time(demo_requests_total[30m]))": "101", "max scrape_series_added (20s)": "1", "scrape_samples_scraped": "0", "prometheus_tsdb_head_series": "3081"}
+```
+The second run's `before` already shows **101** historical series left from the first run: nothing had deleted them. Its first labelled scrape reports `scrape_series_added` = **100**. The in-memory series count grew by only 36 this time (3009 → 3045), because the same label sets were already in memory from the first run. The first run's +142 (2830 → 2972) was the real cost: 100 demo series, plus the new target's `up`/`scrape_*` series and other churn.
+
+The screenshot is `e_prometheus_series_count.png`.
 

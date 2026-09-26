@@ -1,0 +1,1 @@
+{"stage": "baseline", "start_utc": "2026-09-26T20:33:09.564Z", "end_utc": "2026-09-26T20:35:39.365Z", "rate_per_s": 5.0, "sent": 750, "status_counts": {"201": 750}, "client_latency_ms": {"p50": 12.7, "p95": 13.9, "p99": 16.1, "max": 32.1, "mean": 11.6}}

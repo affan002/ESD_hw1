@@ -77,6 +77,7 @@ A hands-on guide to the app and its API is in [WALKTHROUGH.md § A4](WALKTHROUGH
 ### B.1 Setup
 
 - **The app** uses `prometheus_client` 0.26. Every metric is defined in `app/metrics.py` and served at `GET /metrics`. HTTP metrics are recorded in the request middleware, and business metrics at the line where each event happens. It runs as a single process, so no multiprocess mode is needed.
+- **All UIs and APIs are bound to 127.0.0.1**, because nothing has authentication (`/admin/faults`, Grafana, Elasticsearch). Checked from the Wi-Fi address: every port refuses connections.
 - **Prometheus** (`v3.15.0`, port 9090):
   - It scrapes `api:8000`, Node Exporter and itself **every 5 s**.
   - Data is kept for 7 days in the `prometheus-data` volume.
@@ -219,7 +220,7 @@ A second exploration is `sensor_devices` (Fig. B4), which is computed by a colle
 
 It runs directly on the hardware with no VM (`systemd-detect-virt` → `none`), because Docker Engine is installed natively. So these are the physical machine's numbers.
 
-`prom/node-exporter:v1.12.1` runs with `network_mode: host`, `pid: host` and `/` mounted read-only, so it sees the host rather than its own container. Prometheus reaches it at `host.docker.internal:9100`.
+`prom/node-exporter:v1.12.1` runs with `network_mode: host`, `pid: host` and `/` mounted read-only, so it sees the host rather than its own container. It listens only on Docker's bridge address, `172.17.0.1:9100`, which is what `host.docker.internal` resolves to for Prometheus. So it isn't exposed on the LAN; before this fix it published the laptop's hardware details to anyone on the same Wi-Fi.
 
 Its values matched the host's own tools:
 
@@ -325,6 +326,21 @@ The histogram is otherwise flat at 2–6 warnings per 10 s. Its peak (12 at 22:3
 
 *The saved search **Rejected readings (422)**, with the columns `device_id`, `errors.field`, `errors.type` and `request_id`.* 42 of the 43 rows are dev-019, and the reasons rotate: `timestamp · timestamp_in_future`, `temperature_c · missing`, `humidity_pct · less_than_equal`. The one exception is my own test reading as dev-100. An integrator would see exactly what's wrong with their payloads, and the values they sent are never shown. Each row's `request_id` (`sim-…`) leads to the matching simulator line.
 
+**Searching for errors.** Normal operation writes no ERROR lines, so to show the search working I switched on the error fault (every 10th reading fails) for 30 s at 18:54:26 UTC.
+
+![Kibana: level : "ERROR" during a 30-second error fault](docs/screenshots/c_kibana_errors.png)
+
+*`level : "ERROR"` returns **22** documents: 11 injected failures, each logged twice by `sensor-api` (`fault_injected` + `http_request POST /readings -> 500`). The histogram bars come about every 2.5 s, exactly "every 10th reading" at about 4 readings/s, and stop when the fault was switched off at 18:54:56. The saved search* Server errors (5xx) *returns the 11 requests; before the fault it returned 0. Every row carries its `request_id`.*
+
+![Kibana: one failed request across both services](docs/screenshots/c_kibana_error_trace.png)
+
+*Following one of them, `request_id : "sim-e2306ccbc8f2"`, gives the whole failure in both services within 9 ms:*
+1. *The API's `fault_injected` (ERROR).*
+2. *Its `http_request … 500` (ERROR).*
+3. *The simulator's `sim_send_failed … HTTP 500` for dev-014, a WARNING from the client's side.*
+
+*The counts line up exactly: 11 `fault_injected` = 11 API 500s = 11 simulator failures. Both fault switches are logged as `fault_config_changed`, with the request IDs I used to toggle them. (Counted 8 s after the fault ended, the numbers were 10, not 11: Filebeat is near real time, a few seconds behind.)*
+
 ### C.5 Worked example: one log line from the app to a Kibana search
 
 **1. The app writes it**: `anomaly_detected` for `POST /readings` with `X-Request-ID: c5-demo-1` and 41.5 °C:
@@ -373,11 +389,195 @@ Two lessons came out of this:
 
 ## D. System design
 
-_Not started._
+### D.1 Architecture
+
+![Architecture diagram](docs/diagrams/architecture.png)
+
+*The source is [`docs/diagrams/architecture.mmd`](docs/diagrams/architecture.mmd) (Mermaid, rendered by `scripts/render_diagram.sh`), so the diagram is versioned text next to the configuration it describes.*
+
+**How the components communicate.** There are two independent paths out of the app:
+- **Metrics are pulled.** Prometheus fetches `GET api:8000/metrics` and Node Exporter's `/metrics` every 5 s, and Grafana sends it PromQL queries through the datasource with uid `prometheus`.
+- **Logs are pushed.** The app only prints JSON to stdout. Docker writes it to a file, and Filebeat finds our containers through `docker.sock`, tails those files, and sends `_bulk` requests to Elasticsearch, which Kibana searches with KQL.
+- **Setup runs once per start.** `logs-setup` installs the retention policy, index template, data view and saved searches, and Filebeat only starts after it has exited successfully.
+
+The app knows about **neither** observability path, which is why no monitoring component can break it (D.2).
+
+**Where data is stored, and why:**
+
+| Data | Store (volume) | Kept | Why this store |
+|---|---|---|---|
+| Readings, devices | SQLite `/data/sensors.db` (`sensor-data`) | forever | One file, no extra service; one transaction per reading easily handles about 4 writes/s |
+| Metrics | Prometheus TSDB (`prometheus-data`) | 7 days | Compressed time series, built for `rate()` and percentiles over time |
+| Raw log lines | Docker json-file (per container) | 3 × 10 MB ≈ 2.5 h at 3.3 KB/s; deleted with the container | A short-term buffer only, so Filebeat can catch up after outages |
+| Filebeat's read positions | registry (`filebeat-data`) | — | So a restart neither re-sends nor skips lines |
+| Indexed logs | Elasticsearch data stream `sensor-logs` (`es-data`) | about 1 h 10 min (ILM: roll over every 10 min, delete 1 h after rollover) | Searchable by field; retention deliberately short so it can be demonstrated |
+| Dashboards, data view, searches | files in `monitoring/` (git) | — | Reproducible: rebuilt on every start |
+
+### D.2 What happens if a component stops (tested)
+
+Each component was stopped for 25–50 s on the running stack, with a tagged reading sent during the outage (docs/BUILD_LOG.md, D1):
+
+| Stopped | Users (API and dashboard) | Other components | Data | Recovery |
+|---|---|---|---|---|
+| **api** | **Down**: every endpoint refuses connections | Prometheus records `up=0` (7 samples); counters restart at 0, which `rate()` handles | **141 readings lost**: the simulator got `ConnectError` and doesn't retry | `start`: rates climb back as the 1-minute window refills |
+| **simulator** | fine | — | no new readings; checked at 40 s, **all 21 devices `stale`** (the threshold is 30 s) (the API and `sensor_devices` agree) | devices `ok` within 20 s |
+| **prometheus** | fine: the app doesn't know it exists | Grafana panels fail (DNS error) | **Permanent metrics gap**: 6 of 14 samples; nothing buffers a pull | history before and after is intact |
+| **grafana** | fine | none | none: 12 of 12 samples kept | dashboards come back complete |
+| **node-exporter** | fine | `node` target `down`, and Prometheus *records* `up=0` | host-metric gap | `start` |
+| **elasticsearch** | fine | Kibana unavailable; Filebeat logs `failed to publish`, then retries with backoff | **Nothing lost**: the outage's logs arrived afterwards (every 10-s bucket 84–94 documents) | Filebeat resends from its registry position |
+| **kibana** | fine | none: ingestion continues (35,135 → 35,921 documents) | none | about 1 min to boot |
+| **filebeat** | fine | — | logs wait in Docker's file, then arrive (C.3). Real loss only after about 2.5 h, when rotation overwrites them | resumes from the registry, no duplicates |
+| logs-setup fails *(not tested)* | fine | Filebeat never starts (`service_completed_successfully`) | logs wait in Docker's file, within the same 2.5 h | re-run `docker compose up logs-setup` |
+
+**What this shows:** only the **api** matters to users, and the only data loss comes from its clients not retrying. Metrics and logs fail in opposite ways. A pull that doesn't happen is gone forever, so a Prometheus outage leaves a permanent gap. A push that fails is retried from a durable file, so an Elasticsearch outage loses nothing. A target that stops (API, Node Exporter) is itself recorded as `up=0`, but an outage of Prometheus itself isn't recorded anywhere.
+
+### D.3 Follow a metric: `sensor_anomalies_total{reason="humidity_low"}`
+
+This series was chosen because no simulated device produces it, and it was at 0, so one reading (`X-Request-ID: d2-follow-1`, humidity 10 %, sent at 19:33:16.554 UTC) is the only thing that moves it:
+1. **The code updates it.** `evaluate()` returns `["humidity_low"]`, and `metrics.ANOMALIES.labels(reason).inc()` runs ([app/main.py:158](app/main.py#L158)). The counter is defined at [app/metrics.py:66](app/metrics.py#L66) and created at 0 on startup.
+2. **The app exposes it.** Straight away, `curl localhost:8000/metrics` shows `sensor_anomalies_total{reason="humidity_low"} 1.0`, where it was `0.0` before.
+3. **Prometheus collects and stores it.** The next scrape of `api:8000` (job `sensor-api`) at **19:33:18.449** took 9.6 ms, and added the sample `(19:33:18, 1)` to the series `{__name__="sensor_anomalies_total", instance="api:8000", job="sensor-api", reason="humidity_low"}`. That's **2.2 s** after the event; it can be up to 5 s, depending on where the scrape cycle is.
+
+![Prometheus: the raw counter steps from 0 to 1](docs/screenshots/d_prometheus_raw_counter.png)
+
+*The raw series in Prometheus's graph view (5 s resolution): 0 at every scrape until 19:33:13, then **1.00 from the 19:33:18 scrape on**. A counter only ever goes up, so on its own this line says little. Its **rate of change** is the useful signal.*
+
+4. **Grafana queries and shows it.** The panel *Anomalies per minute by reason* runs `sum by (reason) (increase(sensor_anomalies_total[1m]))`. For `humidity_low` that reads **1.05 from 19:33:21 to 19:34:11, then 0**: the 1-minute window slides over the single increase and moves on. (It's 1.05, not 1, because `increase()` extrapolates to the edges of the window. Grafana's own API returned 1.03 at 19:33:40.)
+
+![Grafana: anomalies per minute, with the single humidity_low reading](docs/screenshots/d_grafana_anomalies_by_reason.png)
+
+*Times are in PKT (UTC+5). The blue `humidity_low` line is a **one-minute plateau at about 1** (00:33:20–00:34:10): our one reading.*
+
+*The other lines have their own story. `battery_low` and `temperature_high` **ramp up from 0 at about 00:32:30** because the simulator had been restarted in D.2 (at 00:31:04), which resets its device profiles:*
+- *dev-018's battery starts again at 20 % and needs about 100 s to fall below 15 %.*
+- *dev-017 starts again from normal temperature.*
+- *Once both are anomalous, each reason plateaus at 12/min (one reading every 5 s).*
+
+*`temperature_high` drops back to 0 at about 00:35, when dev-017's overheat cycle resets.*
+
+### D.4 Follow a log: the same reading's `anomaly_detected` line
+
+How the line's format changes at each hop:
+
+| Hop | Format |
+|---|---|
+| 1. **The code writes it** ([app/main.py:176](app/main.py#L176) → `JsonFormatter`, [app/logging_setup.py:41](app/logging_setup.py#L41)) | one JSON object on stdout: `{"timestamp": "2026-09-26T19:33:16.567Z", "level": "WARNING", "service": "sensor-api", "event": "anomaly_detected", "message": "anomaly detected: humidity_low", "request_id": "d2-follow-1", "device_id": "dev-100", "reading_id": 145080, "anomaly_reasons": ["humidity_low"], "humidity_pct": 10.0, …}` |
+| 2. **Docker saves it** in `/var/lib/docker/containers/ae33aec25ed1…/…-json.log` | wrapped in an envelope, our line escaped inside a string: `{"log":"{\"timestamp\": \"2026-09-26T19:33:16.567Z\", …}\n","stream":"stdout","time":"2026-09-26T19:33:16.567348287Z"}` |
+| 3. **Filebeat collects it**, through the input `container-ae33aec25ed1…`, which autodiscover started when the container was created (18:53:34) because its name matched `esd_hw1-(api\|simulator)-N` | `container` parser: `message` = our line, `stream` = stdout, plus `container.*` → `copy_fields`: `log.original` = our line → `decode_json_fields`: every key becomes a top-level field, and `message` becomes the sentence → `timestamp`: `@timestamp` = 19:33:16.567Z (the app's time, not Docker's …567348287) → `drop_fields` |
+| 4. **Elasticsearch stores it** in backing index `.ds-sensor-logs-2026.09.26-000017`, document `odk136ABdEksZtjUOIBI` | a flat, typed document: `request_id`, `event`, `level`, `device_id`, `anomaly_reasons` as `keyword`; `humidity_pct` as `float`; `reading_id` as `long`; `log.original` stored but not indexed |
+| 5. **Kibana finds it** with `request_id : "d2-follow-1"` | a row in Discover (below) |
+
+All 3 documents for the request were searchable **6.6 s** after the reading was sent. The same metric reached Prometheus in 2.2 s.
+
+![Kibana: every log line of the traced request](docs/screenshots/d_kibana_follow_log.png)
+
+*`request_id : "d2-follow-1"` returns exactly the **3 lines** the API wrote for this one reading, within 1 ms of each other:*
+1. *`reading_stored`*
+2. *`anomaly_detected` with `anomaly_reasons` = `humidity_low`, the line traced above*
+3. *`http_request` `POST /readings -> 201`, taking 5.9 ms*
+
+*The metric in D.3 only says that **a** `humidity_low` anomaly happened in that minute. The log says **which** device, which reading, and what the values were.*
+
+### D.5 Open questions
+
+These are things I relied on without verifying:
+
+1. **Why do the backing index numbers skip?** From `-000007` on they're odd only (`000007, 000009, …, 000017`), with `generation: 18` for 6 indices. The failure store is disabled and empty, but it's set to `rollover_on_write: true`. My guess is that it shares the generation counter, but I haven't confirmed that in Elasticsearch's documentation or source.
+2. **Exactly when does ILM act?** Rollovers came 10–11 min apart, and the deletion came 1.03 h after rollover. I *attribute* the extra minute to the 1-minute poll interval, and the late `-000017` (19:27:28, due about 19:25) to the Elasticsearch restart. I didn't trace ILM's own step history (`_ilm/explain` gives only the current step).
+3. **How big is Filebeat's buffer, and is rotation really safe?** It survived a 50 s Elasticsearch outage with no loss, but I don't know its in-memory queue size, or what it does when Docker **rotates** a file it hasn't finished reading. The input's path is `*-json.log`, which doesn't match the rotated `…-json.log.1`. So the "2.5 h of safety" figure assumes Filebeat keeps the old file open, and that's untested.
+4. **The exact formula behind `increase()` and `rate()`.** I've seen one increment reported as 1.05 or 1.03 depending on when it's evaluated, and a `rate()` that decays smoothly across an API restart instead of breaking. I understand the idea (extrapolating to the window's edges, handling counter resets), but I haven't checked the formula.
+5. **Why Kibana needs 1.7 GiB.** It loads about 200 plugins. I haven't measured which ones could be disabled for a logs-only use.
 
 ## E. Experiments
 
-_Not started._
+### E.1 Reproduce a problem: every 5th reading takes 500 ms longer
+
+**Repeatable test.**
+- `scripts/load.py --rate 5 --duration 150` sends a normal reading for `dev-100` every 0.2 s. It's open loop: a slow response doesn't slow the next send. Each request carries `X-Request-ID: load-<stage>-NNNNN`.
+- The simulator was stopped first, so the load was the only `POST /readings` traffic. Each stage is 150 s: 30 scrapes and 750 requests.
+- `scripts/e1_stage_stats.py` takes each stage's numbers from Prometheus, evaluated over exactly that window, and counts the stage's logs in Elasticsearch.
+- The fault was switched on with `PUT /admin/faults {"delay_ms":500,"delay_every_n":5}` and off with `DELETE /admin/faults`.
+- The raw outputs are in `docs/results/`.
+
+**Predictions** were written before the fault started: [`docs/results/e1_predictions.md`](docs/results/e1_predictions.md), at 20:36:33Z; the fault went on at 20:36:50Z.
+- **p50** should stay at about 12 ms, because 80 % of requests aren't delayed.
+- **p95 and p99 from the histogram** should read **0.875 s and 0.975 s**. Delayed requests take about 512 ms, which puts them in the 0.5–1 s bucket, and `histogram_quantile` interpolates linearly inside it: 0.5 + (0.95 − 0.80)/0.20 × 0.5.
+- **The true p95** should be about 515 ms.
+- **The mean** should rise by about 100 ms, and **Apdex** fall to 0.80.
+- There should be **150 `fault_injected` logs** and **150 `http_request` lines over 400 ms**, and the delayed requests should be `load-fault-00004`, `-00009`, …
+- **5xx and DB write time** should be unchanged.
+
+**Results** (2026-09-26 UTC):
+
+| Stage | Window | Requests | Server p50 / p95 / p99 | Mean | Client p95 | Apdex | `fault_injected` | Logs > 400 ms | 5xx |
+|---|---|---|---|---|---|---|---|---|---|
+| baseline | 20:33:10–20:35:39 | 750 | 11.9 / 14.7 / 15.0 ms | 11.1 ms | 13.9 ms | 1.00 | 0 | 0 | 0 |
+| **fault** | 20:36:51–20:39:21 | 750 | **12.8 / 875 / 975 ms** | **111.5 ms** | **513.9 ms** | **0.80** | **150** | **150** | 0 |
+| recovery | 20:41:19–20:43:49 | 750 | 11.9 / 14.7 / 15.0 ms | 11.2 ms | 13.9 ms | 1.00 | 0 | 0 | 0 |
+
+**15 of the 17 predictions held**, the histogram's 0.875 / 0.975 s exactly. All 150 delayed requests had IDs ending in 4 or 9. DB write time didn't move (4.6 → 4.7 ms), because the sleep happens before the database write. The full check is in docs/BUILD_LOG.md (E1.4).
+
+**Two predictions were wrong:**
+- **P11: I expected "requests in flight" to show 2 often.** It averaged 1.04. The delayed requests are in flight at the same fraction of every second (.657 to .157), while Prometheus always scrapes at .449, so the 5-second samples systematically miss them. A gauge sampled every 5 s can't see something that happens on a regular 1-second cycle.
+- **P17: I expected p95 to take about 60 s to recover.** It took about 10 s. The 1-minute window held almost no slow requests by then, because I'd left a two-minute gap between the fault stage and the recovery stage.
+
+![Latency percentiles across the three stages](docs/screenshots/e_grafana_latency_three_stages.png)
+
+*Grafana, times in PKT (UTC+5):*
+- *In the baseline (01:33–01:36) all three lines lie flat near 15 ms.*
+- *In the fault stage (01:37–01:40), **p95 jumps to about 875 ms and p99 to about 975 ms, while p50 (green) doesn't move**. Most users are fine; one request in five is slow.*
+- *In the recovery stage (01:41–01:44) it's flat again. The gaps between stages are periods with no traffic, where a percentile of zero requests is undefined.*
+
+*The charted p95 is the **interpolated** 875 ms, while the real slow requests took about 514 ms (the client measured 513.9 ms). The histogram only knows they fell "between 0.5 and 1 s". That's the same bucket-resolution effect as in B.4.*
+
+![Apdex across the three stages](docs/screenshots/e_grafana_apdex_three_stages.png)
+
+*Apdex steps from **1.00 to exactly 0.80 and back**. The 20 % of requests over 100 ms count as "frustrated", everyone else is "satisfied", and nobody falls in between. It's one number that turns "one in five is slow" into a clear drop, which p50 or the mean alone hide or blur.*
+
+![Kibana: http_request lines slower than 400 ms](docs/screenshots/e_kibana_slow_requests.png)
+
+*Kibana: `event : "http_request" and duration_ms > 400` over the same 12 minutes returns **151** documents: the 150 delayed load requests, **exactly 1 per second (10 per 10 s bar), only during the fault stage**, plus one from the timeout test below (the small bar at 01:40). Every row names the request: `load-fault-00004` at 527 ms, `-00009` at 510 ms, …, so a single slow call can be followed through the logs. The metrics only showed that 20 % were slow.*
+
+**Cause and effect on users.**
+- **The simulator and device firmware** send one reading at a time. Every 5th send now blocks for half a second, so a device waits about 0.5 s longer for its acknowledgement. Nothing fails: 750 of 750 got `201`, the error rate stayed 0, and the dashboard didn't change. The dashboard only uses `GET` routes, which the fault doesn't touch.
+- **A caller with a short timeout gets hurt badly.** During the fault I sent 5 readings with `curl --max-time 0.25`, then retried the one that timed out, the way a careful integrator would:
+  - The client saw a timeout, but **the server finished the request anyway**. It stored the reading after its sleep and logged `201` in 514 ms.
+  - The retry was stored as well, so **5 readings produced 6 rows** (ids 160160 and 160161, identical).
+  - The retry was stored **before** the original, so even the order is wrong.
+
+  A slow dependency can turn into **duplicate and out-of-order data**, and the server's own logs call both requests successful. The fix would be on both sides: the client should send an idempotency key (e.g. device ID + timestamp), and the server should reject a second reading with the same key.
+
+**Recovery.** After `DELETE /admin/faults`, both the metrics and the logs returned to the baseline values exactly (table above), and a `fault_config_changed` line marks when.
+
+### E.2 Cardinality explosion (capped at 100)
+
+`scripts/cardinality_demo.sh` runs `scripts/cardinality_demo.py` as a throwaway process with **its own `CollectorRegistry`**, never the app's. It's the opt-in Compose service `cardinality-demo` (profile `e2`), and Prometheus finds it through `file_sd/cardinality-demo.json`, which holds `[]` except during the demo. The script:
+1. Exposes `demo_requests_total{request_id="req-0000"…"req-0099"}`: 100 fake request IDs. The cap of 100 is enforced in code.
+2. Waits two scrapes.
+3. Restarts the exporter **without** the label: the same 100 increments on one series.
+4. Waits two scrapes, then cleans up.
+
+| Snapshot (UTC) | `count(demo_requests_total)` | `count(last_over_time(demo_requests_total[30m]))` | `prometheus_tsdb_head_series` |
+|---|---|---|---|
+| before (20:46:39) | 0 | 0 | 2830 |
+| with `request_id` label (20:46:51) | **100** | 100 | 2972 |
+| label removed, restarted (20:47:04) | **1** | **101** | 3009 |
+| exporter stopped (20:47:16) | 0 | **101** | 3009 |
+
+![Series count vs stored history](docs/screenshots/e_prometheus_series_count.png)
+
+*Top: `count(demo_requests_total)`. It's **100** while the labelled exporter is scraped, **1** after the restart without the label, and nothing once the target is gone. The run was repeated at 20:48 with the same result.*
+
+*Bottom: `count(last_over_time(demo_requests_total[30m]))`. It jumps to **101** and **stays at 101 through the restart, the cleanup and the second run**.*
+
+*When a series stops being scraped, Prometheus marks it stale, so instant queries stop returning it. But its samples remain on disk and in memory until retention removes them (7 days here). The in-memory series count (`prometheus_tsdb_head_series`) didn't fall either. **Removing a label stops the growth; it doesn't delete the history.***
+
+**The cost at scale.** Series = metric × every distinct combination of label values.
+- **The demo:** 100 requests became 100 series.
+- **If `request_id` were a label on this app's latency histogram,** every request would create a new combination, and each combination costs 18 series (15 buckets + `+Inf` + `_sum` + `_count`). At the simulator's 4 requests/s that's about 345,600 requests a day, **about 6.2 million new series per day for one metric**. Today the whole app exposes about 255.
+- **Each of those series** holds a single sample, but it still gets an index entry, a memory chunk and write-ahead-log records. Every `sum()` or `rate()` over the metric would have to touch millions of series. Memory, disk and query time grow with the number of series, not with traffic.
+- **That's why this app's rule is "never use `device_id`, `request_id` or raw paths as labels; they belong in logs"** (CLAUDE.md, B.1). The app follows it: its labels are route templates, status codes and outcome names, fewer than 20 values each.
+- **The per-request question belongs in logs.** Elasticsearch stores one document per event, with `request_id` indexed as a keyword. The lookup E.2 would have abused a metric for is a single search: `request_id : "d2-follow-1"` returned exactly 3 documents (D.4), and `request_id : "load-fault-00004"` finds the slow request above.
 
 ---
 

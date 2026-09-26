@@ -1,0 +1,42 @@
+[
+  {
+    "stage": "before",
+    "t": "2026-09-26T20:47:59Z",
+    "count(demo_requests_total)": "0",
+    "sum(demo_requests_total)": "0",
+    "count(last_over_time(demo_requests_total[30m]))": "101",
+    "max scrape_series_added (20s)": "0",
+    "scrape_samples_scraped": "0",
+    "prometheus_tsdb_head_series": "3009"
+  },
+  {
+    "stage": "with_label",
+    "t": "2026-09-26T20:48:12Z",
+    "count(demo_requests_total)": "100",
+    "sum(demo_requests_total)": "100",
+    "count(last_over_time(demo_requests_total[30m]))": "101",
+    "max scrape_series_added (20s)": "100",
+    "scrape_samples_scraped": "100",
+    "prometheus_tsdb_head_series": "3045"
+  },
+  {
+    "stage": "without_label",
+    "t": "2026-09-26T20:48:24Z",
+    "count(demo_requests_total)": "1",
+    "sum(demo_requests_total)": "100",
+    "count(last_over_time(demo_requests_total[30m]))": "101",
+    "max scrape_series_added (20s)": "100",
+    "scrape_samples_scraped": "1",
+    "prometheus_tsdb_head_series": "3081"
+  },
+  {
+    "stage": "after_cleanup",
+    "t": "2026-09-26T20:48:37Z",
+    "count(demo_requests_total)": "0",
+    "sum(demo_requests_total)": "0",
+    "count(last_over_time(demo_requests_total[30m]))": "101",
+    "max scrape_series_added (20s)": "1",
+    "scrape_samples_scraped": "0",
+    "prometheus_tsdb_head_series": "3081"
+  }
+]

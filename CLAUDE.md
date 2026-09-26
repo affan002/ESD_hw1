@@ -4,11 +4,12 @@ Conventions for this repo. Keep them consistent, and update this file only when 
 
 ## Project
 - IoT sensor ingestion API, plus a device simulator. It's the base app for an observability assignment (Parts A–E).
-- **Parts A (API, dashboard and simulator), B (Prometheus, Grafana, Node Exporter) and C (Filebeat → Elasticsearch → Kibana) are complete and verified.** Parts D–E (system design, the experiments) have not started. Don't add the experiment code (such as a `request_id`-labelled counter) until asked.
+- **Parts A (API, dashboard and simulator), B (Prometheus, Grafana, Node Exporter), C (Filebeat → Elasticsearch → Kibana) and D (system design) are complete and verified.** Part E (the experiments) is complete: E1 (fault injection with a steady load) and E2 (a cardinality demo).
 - Living docs, updated stage by stage after each stage's done check passes:
   - `REPORT.md`: **concise**, answering exactly what each part of the assignment asks, in short paragraphs and tables. The style is `A. Project`, `B.1 …` numbered subsections, and conclusions with the key numbers only. Aim for about 50–100 lines per part. No stage-by-stage logs.
   - `WALKTHROUGH.md`: a **learning guide for the author**, not a reference. Each part has concept, code pointers (`[file:line](file#Lline)`), exercises (predict, then run), how to read the dashboards, and check-yourself questions. When code moves, update its line links (check with `grep -n`). When a part is finished, add its section in the same style.
-  - Screenshots go in `docs/screenshots/`, named with a part prefix (`a_…`, `b_…`, `c_…`). Kibana screenshots use Discover URLs with `_g=(time:(from:'…Z',to:'…Z'))` and `_a=(dataSource:(dataViewId:sensor-logs,type:dataView),query:(language:kuery,query:'…'))`, captured with headless Chrome using `--virtual-time-budget=40000`. If the file size doesn't change after a capture, it failed (Kibana wasn't ready). Capture them with `scripts/capture_screenshots.sh`, which uses headless Chrome, a fixed absolute time window (never `now`, because virtual time makes graphs dip at the right edge) and the light theme. Every screenshot in the report needs an interpretation of what it actually shows, not just a caption.
+  - Screenshots go in `docs/screenshots/`, named with a part prefix (`a_…`, `b_…`, `c_…`, `d_…`). Kibana screenshots use Discover URLs with `_g=(time:(from:'…Z',to:'…Z'))` and `_a=(dataSource:(dataViewId:sensor-logs,type:dataView),query:(language:kuery,query:'…'))`, captured with headless Chrome using `--virtual-time-budget=40000`. If the file size doesn't change after a capture, it failed (Kibana wasn't ready). Capture them with `scripts/capture_screenshots.sh`, which uses headless Chrome, a fixed absolute time window (never `now`, because virtual time makes graphs dip at the right edge) and the light theme. Every screenshot in the report needs an interpretation of what it actually shows, not just a caption.
+  - **The architecture diagram is text:** `docs/diagrams/architecture.mmd` (Mermaid, `flowchart LR`), rendered to `.svg`/`.png` by `scripts/render_diagram.sh` (headless Chrome with Mermaid 11 from jsDelivr, PNG at 2×). **Keep it simple:** one subgraph per concern (Clients, sensor-api, Metrics, Logs), one or two short lines per node, and a short label per arrow. Failure behaviour and storage detail go in REPORT D.1–D.2 tables, not in the diagram. **When `docker-compose.yml` or a `monitoring/` config changes a service, port or connection, update the `.mmd` and re-render.**
   - `docs/BUILD_LOG.md`: the stage-by-stage evidence (what was built, the exact command, the trimmed real output). Append a section per stage here; the report links to it.
   - `README.md`: start/use/test/clean up. It must always match what runs right now.
   - `CLAUDE.md`: this file.
@@ -26,23 +27,27 @@ Conventions for this repo. Keep them consistent, and update this file only when 
   - `__main__.py`: `python -m app`.
   - `metrics.py`: every Prometheus metric, plus the device-status collector.
   - `static/`: the operator dashboard.
-- `monitoring/`: Prometheus config (`prometheus/prometheus.yml`) and Grafana provisioning and dashboards (`grafana/`).
+- `monitoring/`: Prometheus config (`prometheus/prometheus.yml`), Grafana provisioning and dashboards (`grafana/`), `filebeat/filebeat.yml`, `elasticsearch/` (index template, ILM policy), `kibana/saved-objects.ndjson`, and `logs-setup.sh`.
+- `docs/`: `BUILD_LOG.md` (evidence), `diagrams/` (the architecture as Mermaid, plus its renders) and `screenshots/`.
+- `scripts/`: `capture_screenshots.sh`, `render_diagram.sh`, and the Part E experiment scripts: `load.py`, `e1_stage_stats.py`, `cardinality_demo.py` and `cardinality_demo.sh`.
+- `docs/results/`: raw experiment outputs (JSON), plus `e1_predictions.md`. Predictions are written **before** a run and never edited afterwards.
 - `simulator/`: the device fleet simulator (`python -m simulator.simulate`).
 - `tests/`: pytest. The `client` fixture in `conftest.py` builds the app against a temporary `DB_PATH`.
 
 ## Run and test
 - Tests: `.venv/bin/pytest -q`
 - API locally: `.venv/bin/python -m app` (port 8000)
-- Docker: `docker compose up -d --build` (the full stack: api, simulator, prometheus, node-exporter, grafana) · API only: `docker compose up -d --build api` · stop: `docker compose down` · wipe all data, including metrics history: `docker compose down -v`
+- Docker: `docker compose up -d --build` (the full stack: api, simulator, prometheus, node-exporter, grafana, elasticsearch, kibana, filebeat, and the one-shot logs-setup) · API only: `docker compose up -d --build api` · stop: `docker compose down` · wipe all data, including metrics history: `docker compose down -v`
 
 ## Docker and ports
+- **Every published port is bound to 127.0.0.1** (`"127.0.0.1:8000:8000"`, and the same for 3000, 9090, 9200 and 5601). Nothing in the stack has authentication (`/admin/faults`, Grafana anonymous, Elasticsearch security off), so never publish on 0.0.0.0. Node Exporter (host network) uses `--web.listen-address=172.17.0.1:9100`, Docker's bridge address, which is what `host.docker.internal` resolves to for Prometheus.
 - Compose service `api` → image `sensor-api:dev`, port **8000**. Compose service `simulator` reuses the same image and has no ports.
 - Compose service `prometheus` (`prom/prometheus:v3.15.0`) on port **9090**, with volume `prometheus-data` and 7-day retention.
   - Config: `monitoring/prometheus/prometheus.yml`, mounted read-only. It reloads with `curl -XPOST localhost:9090/-/reload` because `--web.enable-lifecycle` is on.
   - Scrape interval **5 s**. Jobs: `sensor-api` → `api:8000` and `prometheus` → `localhost:9090`.
   - Job `node` → `host.docker.internal:9100`. This needs `extra_hosts: host-gateway` on `prometheus`.
   - All monitoring config lives under `monitoring/`.
-- Compose service `node-exporter` (`prom/node-exporter:v1.12.1`) uses `network_mode: host`, `pid: host` and `/:/host:ro,rslave` with `--path.rootfs=/host`. It listens on host port **9100**, and has no `ports:` entry because it's on the host network. Don't move it onto the Compose network, or it will measure a container instead of the host.
+- Compose service `node-exporter` (`prom/node-exporter:v1.12.1`) uses `network_mode: host`, `pid: host` and `/:/host:ro,rslave` with `--path.rootfs=/host`. It listens on **172.17.0.1:9100** only (not the LAN), and has no `ports:` entry because it's on the host network. From the host, use `curl 172.17.0.1:9100/metrics`. Don't move it onto the Compose network, or it will measure a container instead of the host.
 - Never display `node_dmi_info`'s `chassis_asset_tag`, or MAC addresses, in dashboards or the report.
 - Compose service `grafana` (`grafana/grafana:13.2.2`) on port **3000**, with volume `grafana-data`. Anonymous Viewer access is on; admin login is admin/admin.
   - **Everything is provisioned from files and nothing is clicked together in the UI.** The datasource is in `monitoring/grafana/provisioning/datasources/prometheus.yml` (uid **`prometheus`**; every panel references it by this uid). The dashboard provider is `provisioning/dashboards/dashboards.yml` (folder "Sensor Ingestion", `allowUiUpdates: false`).
@@ -150,6 +155,12 @@ Conventions for this repo. Keep them consistent, and update this file only when 
 - Docker log rotation for `api` and `simulator` uses the `x-app-logging` anchor: `json-file`, 3 × 10 MB.
 - Checking what's stored: `exists` / `query_string` only see *indexed* fields. To prove a value is absent, scan `_source` (see docs/BUILD_LOG.md C6).
 - Kibana: env settings must be on the Docker image's allowed list. The banner is hidden with `TELEMETRY_OPTIN=false` plus `TELEMETRY_ALLOWCHANGINGOPTINSTATUS=false`.
+
+## Experiments (Part E)
+- `scripts/load.py` and `scripts/e1_stage_stats.py` use the **standard library only**, so they run with the system `python3`. The load is **open loop** (a fixed start rate, with a thread pool), and each request ID is `load-<stage>-NNNNN`. Stop the simulator during E1, so the fault's every-Nth counter and the percentiles see only the load.
+- Per-stage server numbers come from `increase(...[stage length − 15 s])` evaluated at the stage end (see `e1_stage_stats.py`), never from a `[1m]` panel value read at some moment.
+- **The E2 cardinality demo must never touch the app's registry or labels.** `scripts/cardinality_demo.py` builds its own `CollectorRegistry()` in `build_registry()` and caps IDs at `MAX_IDS = 100`; `tests/test_cardinality_demo.py` enforces both. It runs only as the Compose service `cardinality-demo` in profile **`e2`**, never in the default stack.
+- Prometheus finds the demo through the job `cardinality-demo`, which uses `file_sd_configs` on `monitoring/prometheus/file_sd/*.json`. **`cardinality-demo.json` must be `[]` in git**, and the demo script writes the target and resets it (a `trap` on exit). Never add a `request_id`-style label to anything in `app/`.
 
 ## Code rules
 - All output goes through `logging`. Never use `print()`.

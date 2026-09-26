@@ -1,0 +1,47 @@
+%% Architecture of the sensor ingestion stack (Part D).
+%% Source of truth for docs/diagrams/architecture.svg / .png; rendered by
+%% scripts/render_diagram.sh. Every arrow matches docker-compose.yml and the
+%% configs in monitoring/. Failure behaviour is in REPORT.md D.2, not here.
+flowchart LR
+    subgraph clients["Clients"]
+        SIM["simulator<br/>20 devices · 4 readings/s"]
+        USER["browser<br/>operator dashboard"]
+    end
+
+    subgraph app["sensor-api (FastAPI, :8000)"]
+        API["HTTP: /readings, /devices, /anomalies,<br/>/admin/faults, /health, /metrics"]
+        DB[("SQLite<br/>sensors.db")]
+    end
+
+    subgraph metrics["Metrics"]
+        GRAF["Grafana :3000<br/>2 provisioned dashboards"]
+        PROM[("Prometheus :9090<br/>5 s scrape · 7 d retention")]
+        NODE["Node Exporter<br/>(host network)"]
+        DEMO["cardinality-demo<br/>(E2 only, opt-in)"]
+    end
+
+    subgraph logs["Logs"]
+        DLOG[("Docker json-file<br/>3 × 10 MB")]
+        FB["Filebeat<br/>autodiscover api + simulator"]
+        ES[("Elasticsearch :9200<br/>sensor-logs · ILM ≈ 1 h")]
+        KB["Kibana :5601<br/>data view sensor-logs"]
+    end
+
+    SETUP["logs-setup<br/>(one-shot)"]
+
+    SIM -- "POST /readings" --> API
+    USER -- "JSON over HTTP" --> API
+    API --- DB
+    PROM -- "GET /metrics every 5 s" --> API
+    PROM -- "GET /metrics" --> NODE
+    GRAF -- "PromQL" --> PROM
+    PROM -. "only during E2" .-> DEMO
+    API -- "stdout: one JSON object per line" --> DLOG
+    SIM -- "stdout" --> DLOG
+    DLOG -- "tail + decode_json_fields" --> FB
+    FB -- "bulk index" --> ES
+    KB -- "KQL" --> ES
+    SETUP -- "ILM policy · index template · data view" --> ES
+    SETUP --> KB
+
+    style DEMO stroke-dasharray: 5 5
